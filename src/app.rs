@@ -660,6 +660,13 @@ pub struct App {
     pub call_devices: crate::calls::DeviceList,
     /// Whether the call screen shows its device pickers.
     pub call_devices_open: bool,
+    /// WhatsApp status/stories cache and state.
+    pub stories: crate::stories::StoriesStore,
+    pub story_viewer: Option<crate::ui::stories::StoryViewerState>,
+    pub post_story_open: bool,
+    pub post_story_text: String,
+    pub post_story_color_idx: usize,
+    pub post_story_font_idx: usize,
     /// Whether the full call screen is put aside so a chat can be read while the call runs. The call
     /// itself is untouched; the surface is what moves, and a bar offers the way back.
     pub call_surface_hidden: bool,
@@ -950,6 +957,13 @@ impl App {
         // With a password set, ZapFast starts locked.
         let app_lock = crate::app_lock::AppLock::new(settings.app_lock_hash.is_some());
         let tray_lockable = settings.app_lock_hash.is_some();
+        let stories_file = dirs.state.join("stories.json");
+        let mut stories = crate::stories::StoriesStore::load(&stories_file);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        stories.clean_expired(now_secs);
         let mut app = Self {
             dirs,
             settings,
@@ -1133,7 +1147,13 @@ impl App {
             call: None,
             call_surface_until: None,
             call_devices: crate::calls::DeviceList::default(),
-            call_devices_open: true,
+            call_devices_open: false,
+            stories,
+            story_viewer: None,
+            post_story_open: false,
+            post_story_text: String::new(),
+            post_story_color_idx: 0,
+            post_story_font_idx: 0,
             call_surface_hidden: false,
             call_fullscreen: false,
             call_notified: None,
@@ -1336,7 +1356,7 @@ impl App {
             sound,
             crate::notify::NotificationTarget {
                 chat: chat_id.to_owned(),
-                message: message.to_owned(),
+                message: Some(message.to_owned()),
             },
             std::sync::Arc::clone(&self.notification_opens),
             move || waker.wake(),
@@ -2732,6 +2752,21 @@ impl App {
                     self.new_contact_pending = false;
                     self.toast_error(message);
                 }
+                Event::StoryReceived(item) => {
+                    self.stories.add(*item);
+                    let stories_file = self.dirs.state.join("stories.json");
+                    self.stories.save(&stories_file);
+                }
+                Event::StoryPosted(result) => {
+                    match result {
+                        Ok(()) => {
+                            self.toast(crate::i18n::gettext(self.locale, "Status update posted"));
+                        }
+                        Err(err) => {
+                            self.toast_error(format!("Failed to post status: {err}"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -3902,7 +3937,7 @@ impl App {
             // A clicked notification opens its message once unlocked; the
             // rest would show or change what the lock hides.
             if let Action::OpenMessage { chat, message } = action {
-                self.app_lock.deferred = Some(crate::notify::NotificationTarget { chat, message });
+                self.app_lock.deferred = Some(crate::notify::NotificationTarget { chat, message: Some(message) });
             }
             return;
         }
@@ -5460,6 +5495,70 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
+            Action::OpenStoryViewer { sender, index } => {
+                self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(sender, index));
+            }
+            Action::CloseStoryViewer => {
+                self.story_viewer = None;
+            }
+            Action::NextStory => {
+                if let Some(viewer) = self.story_viewer.clone() {
+                    if let Some((next_sender, next_index)) = self.stories.next_item(&viewer.sender, viewer.index) {
+                        self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(next_sender, next_index));
+                    } else {
+                        self.story_viewer = None;
+                    }
+                }
+            }
+            Action::PrevStory => {
+                if let Some(viewer) = self.story_viewer.clone() {
+                    if let Some((prev_sender, prev_index)) = self.stories.prev_item(&viewer.sender, viewer.index) {
+                        self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(prev_sender, prev_index));
+                    } else {
+                        self.story_viewer = None;
+                    }
+                }
+            }
+            Action::OpenPostStory => {
+                self.post_story_open = true;
+            }
+            Action::ClosePostStory => {
+                self.post_story_open = false;
+                self.post_story_text.clear();
+            }
+            Action::PostTextStory {
+                text,
+                background_argb,
+                font,
+            } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let id = format!("local-status-{}", now);
+                let my_sender = self.me.clone().unwrap_or_else(|| "me".to_string());
+                self.stories.add(crate::stories::StoryItem {
+                    id: id.clone(),
+                    sender: my_sender,
+                    sender_name: Some("You".to_string()),
+                    timestamp: now,
+                    text: Some(text.clone()),
+                    background_argb: Some(background_argb),
+                    font: Some(font),
+                    media_type: None,
+                    caption: None,
+                    thumbnail: None,
+                    viewed: true,
+                });
+                let stories_file = self.dirs.state.join("stories.json");
+                self.stories.save(&stories_file);
+
+                self.backend.send(Command::PostTextStory {
+                    text,
+                    background_argb,
+                    font,
+                });
+            }
             // Route through the configured window-close behavior.
             Action::CloseWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
@@ -5641,10 +5740,14 @@ impl App {
                 }
                 self.app_lock.unlocked(matched);
                 if matched && let Some(target) = self.app_lock.deferred.take() {
-                    self.actions.push(Action::OpenMessage {
-                        chat: target.chat,
-                        message: target.message,
-                    });
+                    if let Some(message) = target.message {
+                        self.actions.push(Action::OpenMessage {
+                            chat: target.chat,
+                            message,
+                        });
+                    } else {
+                        self.actions.push(Action::OpenChat(target.chat));
+                    }
                 }
             }
             Outcome::WrongCurrent => {
@@ -6763,6 +6866,7 @@ mod tests {
             Contact {
                 id: id.into(),
                 full_name: Some("Ada".into()),
+                first_name: None,
                 push_name: None,
             },
         );
@@ -6782,6 +6886,7 @@ mod tests {
             Contact {
                 id: id.into(),
                 full_name: Some("Ada".into()),
+                first_name: None,
                 push_name: None,
             },
         );
@@ -11611,7 +11716,7 @@ mod app_lock_tests {
             .unwrap()
             .push(crate::notify::NotificationTarget {
                 chat: CHAT.into(),
-                message: "m1".into(),
+                message: Some("m1".into()),
             });
         app.handle_notification_opens();
         app.apply_actions(&ctx);

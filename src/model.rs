@@ -1294,6 +1294,27 @@ pub enum Action {
     /// Takes the call surface full screen, or leaves full screen again. The window moves; the call
     /// does not.
     ToggleCallFullscreen,
+    /// Opens the story viewer for a contact at a given item index.
+    OpenStoryViewer {
+        sender: String,
+        index: usize,
+    },
+    /// Closes the story viewer.
+    CloseStoryViewer,
+    /// Advances to next story in the viewer.
+    NextStory,
+    /// Goes back to previous story in the viewer.
+    PrevStory,
+    /// Opens the post story dialog.
+    OpenPostStory,
+    /// Closes the post story dialog.
+    ClosePostStory,
+    /// Posts a text story to WhatsApp status.
+    PostTextStory {
+        text: String,
+        background_argb: u32,
+        font: u32,
+    },
     /// Creates and opens a chat for a contact without one.
     StartChat {
         id: ChatId,

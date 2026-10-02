@@ -238,12 +238,20 @@ fn live(
     });
 
     ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-        ui.add_space(6.0);
+        ui.add_space(24.0);
+        egui::Frame::new()
+            .fill(Color32::from_black_alpha(210))
+            .corner_radius(CornerRadius::same((CONTROL / 2.0 + 8.0) as u8))
+            .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(35)))
+            .inner_margin(egui::Margin::symmetric(20, 10))
+            .show(ui, |ui| {
+                controls(ui, app, call, palette);
+            });
+
         if app.call_devices_open {
+            ui.add_space(14.0);
             devices(ui, app, call);
-            ui.add_space(12.0);
         }
-        controls(ui, app, call, palette);
     });
 }
 
@@ -735,44 +743,72 @@ fn devices(ui: &mut egui::Ui, app: &mut App, call: &CallUpdate) {
         .collect();
     let connected = call.phase.is_connected();
 
-    ui.horizontal(|ui| {
-        let width = if call.video { 560.0 } else { 384.0 };
-        ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
-        let mut actions = Vec::new();
-        let choices = Picker {
-            salt: "call-microphone",
-            icon: Icon::Mic,
-            title: &gettext(locale, "Microphone"),
-            default_label: &default_label,
-            current: call.microphone.as_deref(),
-            devices: &microphones,
-            enabled: connected,
-        };
-        choices.show(ui, &mut actions, Action::SetCallMicrophone);
-        let choices = Picker {
-            salt: "call-speaker",
-            icon: Icon::Volume2,
-            title: &gettext(locale, "Speaker"),
-            default_label: &default_label,
-            current: call.speaker.as_deref(),
-            devices: &speakers,
-            enabled: connected,
-        };
-        choices.show(ui, &mut actions, Action::SetCallSpeaker);
-        if call.video {
-            let choices = Picker {
-                salt: "call-camera",
-                icon: Icon::Video,
-                title: &gettext(locale, "Camera"),
-                default_label: &default_label,
-                current: call.camera.as_deref(),
-                devices: &cameras,
-                enabled: connected,
-            };
-            choices.show(ui, &mut actions, Action::SetCallCameraDevice);
-        }
-        app.actions.extend(actions);
-    });
+    egui::Frame::new()
+        .fill(Color32::from_rgba_premultiplied(24, 28, 34, 245))
+        .corner_radius(CornerRadius::same(18))
+        .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(45)))
+        .inner_margin(egui::Margin::symmetric(22, 16))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    theme::text(
+                        ui,
+                        gettext(locale, "Audio & Video Devices").into_owned(),
+                        theme::bold(13.5),
+                        Color32::WHITE,
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let close_btn = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("✕").size(14.0).color(Color32::from_white_alpha(190))
+                            ).fill(Color32::TRANSPARENT).frame(false)
+                        );
+                        if close_btn.clicked() {
+                            app.call_devices_open = false;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let mut actions = Vec::new();
+                    let choices = Picker {
+                        salt: "call-microphone",
+                        icon: Icon::Mic,
+                        title: &gettext(locale, "Microphone"),
+                        default_label: &default_label,
+                        current: call.microphone.as_deref(),
+                        devices: &microphones,
+                        enabled: connected,
+                    };
+                    choices.show(ui, &mut actions, Action::SetCallMicrophone);
+                    ui.add_space(16.0);
+                    let choices = Picker {
+                        salt: "call-speaker",
+                        icon: Icon::Volume2,
+                        title: &gettext(locale, "Speaker"),
+                        default_label: &default_label,
+                        current: call.speaker.as_deref(),
+                        devices: &speakers,
+                        enabled: connected,
+                    };
+                    choices.show(ui, &mut actions, Action::SetCallSpeaker);
+                    if call.video {
+                        ui.add_space(16.0);
+                        let choices = Picker {
+                            salt: "call-camera",
+                            icon: Icon::Video,
+                            title: &gettext(locale, "Camera"),
+                            default_label: &default_label,
+                            current: call.camera.as_deref(),
+                            devices: &cameras,
+                            enabled: connected,
+                        };
+                        choices.show(ui, &mut actions, Action::SetCallCameraDevice);
+                    }
+                    app.actions.extend(actions);
+                });
+            });
+        });
 }
 
 /// One device picker: a title with its icon, and a list of what the machine really has.
@@ -805,18 +841,19 @@ impl Picker<'_> {
             .unwrap_or_else(|| self.default_label.to_owned());
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
-                theme::icon(ui, self.icon, 13.0, ui.visuals().weak_text_color());
+                theme::icon(ui, self.icon, 13.0, Color32::from_white_alpha(190));
                 theme::text(
                     ui,
                     self.title,
-                    theme::medium(11.5),
-                    ui.visuals().weak_text_color(),
+                    theme::medium(12.0),
+                    Color32::from_white_alpha(220),
                 );
             });
+            ui.add_space(4.0);
             ui.add_enabled_ui(self.enabled, |ui| {
                 egui::ComboBox::from_id_salt(self.salt)
                     .selected_text(label)
-                    .width(168.0)
+                    .width(180.0)
                     .show_ui(ui, |ui| {
                         if ui
                             .selectable_label(self.current.is_none(), self.default_label)

@@ -26,6 +26,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .frame(Frame::new().fill(palette.panel).inner_margin(Margin::ZERO));
     let response = panel.show(ui, |ui| {
         header(app, ui);
+        super::stories::bar(app, ui);
         list(app, ui);
     });
     let width = response.response.rect.width();

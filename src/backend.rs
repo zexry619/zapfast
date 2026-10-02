@@ -735,6 +735,22 @@ pub enum Command {
         prepared: Box<crate::updates::Prepared>,
         arguments: Vec<String>,
     },
+    /// Post a text status / story to contacts.
+    PostTextStory {
+        text: String,
+        background_argb: u32,
+        font: u32,
+    },
+    /// Post an image status / story.
+    PostImageStory {
+        bytes: Vec<u8>,
+        caption: Option<String>,
+    },
+    /// Mark a story as viewed.
+    ViewStory {
+        sender: String,
+        id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -966,6 +982,10 @@ pub enum Event {
         chat: ChatId,
         saving: bool,
     },
+    /// A new WhatsApp status / story arrived.
+    StoryReceived(Box<crate::stories::StoryItem>),
+    /// Result of attempting to post a status.
+    StoryPosted(Result<(), String>),
 }
 
 /// A change to a group's info, as sent to WhatsApp.

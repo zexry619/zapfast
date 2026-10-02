@@ -15,6 +15,7 @@ pub mod pane;
 pub mod picker;
 pub mod polls;
 pub mod settings;
+pub mod stories;
 pub mod update;
 pub mod video_preview;
 pub mod widgets;
@@ -91,6 +92,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     image_preview::show(app, ctx);
     video_preview::show(app, ctx);
     call::show(app, ctx);
+    stories::viewer_show(app, ctx);
+    stories::post_modal_show(app, ctx);
     drop_target(app, ctx);
     toasts(app, ctx);
     focus_ring(app, ctx);
