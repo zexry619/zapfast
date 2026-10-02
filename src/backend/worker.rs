@@ -36,6 +36,7 @@ use whatsapp_rust::waproto::buffa::Message as _;
 use whatsapp_rust::{MediaRetryResult, MediaReuploadRequest};
 
 mod bot_replies;
+mod calls;
 mod channel_pictures;
 mod device_store;
 mod early_events;
@@ -480,6 +481,9 @@ pub async fn run(
         archive,
         client: None,
         handle: None,
+        call: None,
+        call_devices: crate::calls::DeviceList::default(),
+        call_defaults: crate::calls::CallDevices::default(),
         wa_sender,
         me_pn: None,
         me_lid: None,
@@ -545,6 +549,13 @@ pub async fn run(
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         let deadline = worker.sync_deadline;
+        // Cloned before the select so its branches never borrow the worker: a live call is the only
+        // thing that gives either of these a receiver.
+        let mut call_events = worker.call.as_ref().map(|runtime| runtime.events.clone());
+        let mut call_frames = worker
+            .call
+            .as_ref()
+            .and_then(|runtime| runtime.frames.clone());
         tokio::select! {
             command = inbox.recv() => {
                 match command {
@@ -565,6 +576,18 @@ pub async fn run(
                     worker.favorite_chats_read(generation, complete);
                 }
             },
+            Some(event) = async {
+                match call_events.as_mut() {
+                    Some(events) => events.recv().await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => worker.call_runtime(event),
+            Some(tick) = async {
+                match call_frames.as_mut() {
+                    Some(frames) => frames.recv().await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => worker.call_frame(tick),
             _ = async {
                 match deadline {
                     Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
@@ -589,9 +612,11 @@ pub async fn run(
                 worker.pump_poll_votes();
                 worker.pump_poll_history();
                 worker.prune_waiting_receipts();
+                worker.reconcile_call().await;
             }
         }
     }
+    worker.shutdown_call().await;
     worker.stop_bot().await;
 }
 
@@ -806,6 +831,12 @@ struct Worker {
     downloads: HashSet<(ChatId, String, Option<usize>)>,
     /// Serial forward in flight. The next send waits for the running one.
     forward_queue: Option<ForwardQueue<ForwardJob>>,
+    call: Option<calls::CallRuntime>,
+    /// The devices the call screen was last handed, kept so a device that goes away can be named
+    /// by the description the user saw in the picker rather than by its node name.
+    call_devices: crate::calls::DeviceList,
+    /// The devices a call opens with: the selections the settings persist.
+    call_defaults: crate::calls::CallDevices,
 }
 
 /// A queued forward: where it goes, the protobuf, and its disappearing timer.
@@ -973,6 +1004,10 @@ impl Worker {
         // An upgraded archive has no reliable lock state until the library's
         // authenticated replay has completed. Keep private content off the UI
         // and out of notifications during recovery, including failed retries.
+        // A call is withheld too: its chat may be locked, and until the lock collection is loaded
+        // the interface cannot know it, so an incoming call would take the window and name a
+        // hidden caller. It is re-sent from `reveal_private_content` once the locks are known, so
+        // a call that arrived mid-recovery still rings rather than being lost.
         if !self.privacy_ready
             && matches!(
                 event,
@@ -987,6 +1022,8 @@ impl Worker {
                     | Event::SearchHits { .. }
                     | Event::Labels(_)
                     | Event::Typing { .. }
+                    | Event::Call(_)
+                    | Event::CallDevices(_)
             )
         {
             return;
@@ -1742,6 +1779,10 @@ impl Worker {
         self.privacy_ready = true;
         self.load_state();
         self.emit(Event::Syncing(self.syncing));
+        // A call that was withheld while the locks were unknown is re-sent now that they are: the
+        // chat it belongs to can finally be judged private or not, so it rings against the right
+        // lock state instead of being dropped for the whole recovery.
+        self.replay_call();
         // The picker may have been sent an empty Received shelf meanwhile.
         self.emit_stickers();
         // Answer the reads made while content was withheld, now that the
@@ -1783,8 +1824,11 @@ impl Worker {
         }
         self.lid_to_pn.insert(lid.to_owned(), pn.to_owned());
         match self.archive.put_lid(lid, pn) {
-            Ok(true) => self.emit_chats(),
-            Ok(false) => {}
+            Ok(changed) => {
+                if changed {
+                    self.emit_chats();
+                }
+            }
             Err(error) => log::warn!("could not remember an id mapping: {error}"),
         }
         // Receipts filed under the privacy id may name messages archived
@@ -2183,6 +2227,12 @@ impl Worker {
     async fn handle_wa_event(&mut self, event: Arc<wa_events::Event>) {
         use wa_events::Event as E;
         match &*event {
+            // Call signaling. An `<offer>` that should ring, and the `accept`/`reject`/`terminate`
+            // that decide the call this worker already owns: the peer's answer is the only thing
+            // that moves a call out of dialing, never the fact that dialing started.
+            E::IncomingCall(call) => self.call_signaling(call).await,
+            E::MissedCall(call) => self.call_resolved(&call.call_id),
+            E::CallEndedElsewhere(call) => self.call_resolved(&call.call_id),
             E::PairingQrCode(qr) => {
                 self.qr = Some(qr.code.clone());
                 let status = self.unlinked();
@@ -4233,6 +4283,29 @@ impl Worker {
             }
         }
         match command {
+            Command::StartCall { chat, video } => self.start_call(chat, video).await,
+            Command::AnswerCall => self.answer_call().await,
+            Command::DeclineCall => self.decline_call().await,
+            Command::HangupCall => self.hangup_call().await,
+            Command::SetCallMuted(muted) => self.set_call_muted(muted).await,
+            Command::SetCallCamera(on) => self.set_call_camera(on).await,
+            Command::SetCallMicrophone(device) => self.set_call_microphone(device),
+            Command::SetCallSpeaker(device) => self.set_call_speaker(device),
+            Command::SetCallCameraDevice(device) => self.set_call_camera_device(device),
+            Command::RefreshCallDevices => {
+                self.emit_call_devices().await;
+            }
+            Command::SetCallDevices {
+                microphone,
+                speaker,
+                camera,
+            } => {
+                self.call_defaults = crate::calls::CallDevices {
+                    microphone,
+                    speaker,
+                    camera,
+                };
+            }
             Command::RefreshPoll { chat, message } => self.refresh_poll(chat, message),
             Command::PollHistoryFailed {
                 chat,
@@ -9979,6 +10052,35 @@ mod tests {
         assert!(chats[0].locked);
     }
 
+    /// A call that arrives while the lock state is unknown waits, then rings once it is known.
+    ///
+    /// Emitting it during recovery would take the window with a chat the interface cannot yet
+    /// judge private, naming a hidden caller. It is withheld instead and re-sent by
+    /// `reveal_private_content`, so the call still rings rather than being dropped for the whole
+    /// recovery.
+    #[test]
+    fn a_call_withheld_during_privacy_recovery_rings_once_the_locks_are_known() {
+        let (mut worker, events, _, _) = receipt_tests::worker();
+        const PEER: &str = "fixture@s.whatsapp.net";
+        worker.archive.ensure_chat(PEER, "Fixture").unwrap();
+        let call = crate::calls::Call::test_snapshot(PEER);
+        let update = call.update();
+        worker.call = Some(calls::CallRuntime::new(call, None));
+        unconfirmed(&mut worker);
+        // The update is withheld: the chat's lock state is not known yet.
+        worker.emit(Event::Call(Box::new(update)));
+        assert!(events.try_recv().is_err(), "the call waits for the locks");
+        // Recovery completes and re-sends it, so a call that arrived mid-recovery still rings.
+        worker.preferences_recovered(0, true, true);
+        assert!(worker.privacy_ready);
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Call(_))),
+            "the withheld call is re-sent once the locks are known"
+        );
+    }
+
     /// A chat opened while lock state was still being recovered asked for its
     /// messages once; the answer was withheld, and the interface never asked
     /// again, so the chat stayed empty until a new message came in (#180).
@@ -11249,6 +11351,9 @@ mod receipt_tests {
             archive: Archive::in_memory().expect("archive"),
             client: None,
             handle: None,
+            call: None,
+            call_devices: crate::calls::DeviceList::default(),
+            call_defaults: crate::calls::CallDevices::default(),
             wa_sender,
             me_pn: Some(ME.to_owned()),
             me_lid: None,
