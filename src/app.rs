@@ -667,6 +667,7 @@ pub struct App {
     pub post_story_text: String,
     pub post_story_color_idx: usize,
     pub post_story_font_idx: usize,
+    pub post_story_media_path: Option<PathBuf>,
     /// Whether the full call screen is put aside so a chat can be read while the call runs. The call
     /// itself is untouched; the surface is what moves, and a bar offers the way back.
     pub call_surface_hidden: bool,
@@ -1154,6 +1155,7 @@ impl App {
             post_story_text: String::new(),
             post_story_color_idx: 0,
             post_story_font_idx: 0,
+            post_story_media_path: None,
             call_surface_hidden: false,
             call_fullscreen: false,
             call_notified: None,
@@ -2766,6 +2768,11 @@ impl App {
                             self.toast_error(format!("Failed to post status: {err}"));
                         }
                     }
+                }
+                Event::StoryMediaDownloaded { id, path } => {
+                    self.stories.set_media_path(&id, path);
+                    let stories_file = self.dirs.state.join("stories.json");
+                    self.stories.save(&stories_file);
                 }
             }
         }
@@ -5496,12 +5503,15 @@ impl App {
                 }
             }
             Action::OpenStoryViewer { sender, index } => {
+                self.video.stop();
                 self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(sender, index));
             }
             Action::CloseStoryViewer => {
+                self.video.stop();
                 self.story_viewer = None;
             }
             Action::NextStory => {
+                self.video.stop();
                 if let Some(viewer) = self.story_viewer.clone() {
                     if let Some((next_sender, next_index)) = self.stories.next_item(&viewer.sender, viewer.index) {
                         self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(next_sender, next_index));
@@ -5511,6 +5521,7 @@ impl App {
                 }
             }
             Action::PrevStory => {
+                self.video.stop();
                 if let Some(viewer) = self.story_viewer.clone() {
                     if let Some((prev_sender, prev_index)) = self.stories.prev_item(&viewer.sender, viewer.index) {
                         self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(prev_sender, prev_index));
@@ -5525,6 +5536,7 @@ impl App {
             Action::ClosePostStory => {
                 self.post_story_open = false;
                 self.post_story_text.clear();
+                self.post_story_media_path = None;
             }
             Action::PostTextStory {
                 text,
@@ -5548,6 +5560,7 @@ impl App {
                     media_type: None,
                     caption: None,
                     thumbnail: None,
+                    media_path: None,
                     viewed: true,
                 });
                 let stories_file = self.dirs.state.join("stories.json");
@@ -5558,6 +5571,43 @@ impl App {
                     background_argb,
                     font,
                 });
+            }
+            Action::PostMediaStory { path, caption } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let id = format!("local-status-{}", now);
+                let my_sender = self.me.clone().unwrap_or_else(|| "me".to_string());
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                let is_video = ["mp4", "mov", "mkv", "webm", "3gp"].contains(&ext.as_str());
+
+                self.stories.add(crate::stories::StoryItem {
+                    id: id.clone(),
+                    sender: my_sender,
+                    sender_name: Some("You".to_string()),
+                    timestamp: now,
+                    text: None,
+                    background_argb: None,
+                    font: None,
+                    media_type: Some(if is_video {
+                        crate::stories::StoryMediaType::Video
+                    } else {
+                        crate::stories::StoryMediaType::Image
+                    }),
+                    caption: caption.clone(),
+                    thumbnail: None,
+                    media_path: Some(path.to_string_lossy().to_string()),
+                    viewed: true,
+                });
+                let stories_file = self.dirs.state.join("stories.json");
+                self.stories.save(&stories_file);
+
+                if is_video {
+                    self.backend.send(Command::PostVideoStory { path, caption });
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    self.backend.send(Command::PostImageStory { bytes, caption });
+                }
             }
             // Route through the configured window-close behavior.
             Action::CloseWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Close),

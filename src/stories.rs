@@ -23,6 +23,8 @@ pub struct StoryItem {
     pub media_type: Option<StoryMediaType>,
     pub caption: Option<String>,
     pub thumbnail: Option<Vec<u8>>,
+    #[serde(default)]
+    pub media_path: Option<String>,
     pub viewed: bool,
 }
 
@@ -74,6 +76,17 @@ impl StoriesStore {
             for item in list.iter_mut() {
                 if item.id == id {
                     item.viewed = true;
+                }
+            }
+        }
+    }
+
+    /// Sets the local media path for a downloaded story file.
+    pub fn set_media_path(&mut self, id: &str, path: String) {
+        for list in self.stories_by_sender.values_mut() {
+            for item in list.iter_mut() {
+                if item.id == id {
+                    item.media_path = Some(path.clone());
                 }
             }
         }
@@ -172,6 +185,7 @@ mod tests {
             media_type: None,
             caption: None,
             thumbnail: None,
+            media_path: None,
             viewed: false,
         });
 
@@ -186,6 +200,7 @@ mod tests {
             media_type: None,
             caption: None,
             thumbnail: None,
+            media_path: None,
             viewed: false,
         });
 
@@ -218,6 +233,7 @@ mod tests {
             media_type: None,
             caption: None,
             thumbnail: None,
+            media_path: None,
             viewed: false,
         });
         store.add(StoryItem {
@@ -231,6 +247,7 @@ mod tests {
             media_type: None,
             caption: None,
             thumbnail: None,
+            media_path: None,
             viewed: false,
         });
         store.add(StoryItem {
@@ -244,6 +261,7 @@ mod tests {
             media_type: None,
             caption: None,
             thumbnail: None,
+            media_path: None,
             viewed: false,
         });
 

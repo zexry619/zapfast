@@ -746,6 +746,11 @@ pub enum Command {
         bytes: Vec<u8>,
         caption: Option<String>,
     },
+    /// Post a video status / story.
+    PostVideoStory {
+        path: std::path::PathBuf,
+        caption: Option<String>,
+    },
     /// Mark a story as viewed.
     ViewStory {
         sender: String,
@@ -986,6 +991,11 @@ pub enum Event {
     StoryReceived(Box<crate::stories::StoryItem>),
     /// Result of attempting to post a status.
     StoryPosted(Result<(), String>),
+    /// Full story media downloaded to disk.
+    StoryMediaDownloaded {
+        id: String,
+        path: String,
+    },
 }
 
 /// A change to a group's info, as sent to WhatsApp.

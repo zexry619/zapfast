@@ -1315,6 +1315,11 @@ pub enum Action {
         background_argb: u32,
         font: u32,
     },
+    /// Posts a media story (photo or video) to WhatsApp status.
+    PostMediaStory {
+        path: std::path::PathBuf,
+        caption: Option<String>,
+    },
     /// Creates and opens a chat for a contact without one.
     StartChat {
         id: ChatId,

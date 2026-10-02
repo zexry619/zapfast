@@ -3060,6 +3060,10 @@ impl Worker {
         let mut caption = None;
         let mut thumbnail = None;
 
+        let mut media_path = None;
+        let mut downloadable: Option<Box<dyn Downloadable>> = None;
+        let mut file_ext = "";
+
         if let Some(ext) = base.extended_text_message.as_option() {
             text = ext.text.clone();
             background_argb = ext.background_argb;
@@ -3077,11 +3081,47 @@ impl Worker {
             if img.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
                 thumbnail = img.jpeg_thumbnail.clone();
             }
+            downloadable = Some(Box::new(img.clone()));
+            file_ext = "jpg";
         } else if let Some(vid) = base.video_message.as_option() {
             media_type = Some(crate::stories::StoryMediaType::Video);
             caption = vid.caption.clone().filter(|s| !s.is_empty());
             if vid.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
                 thumbnail = vid.jpeg_thumbnail.clone();
+            }
+            downloadable = Some(Box::new(vid.clone()));
+            file_ext = "mp4";
+        }
+
+        let dir = self.download_dir();
+        if !file_ext.is_empty() {
+            let story_file = dir.join(format!("story-{}.{}", id, file_ext));
+            if story_file.exists() {
+                media_path = Some(story_file.to_string_lossy().to_string());
+            } else if let (Some(client), Some(dl)) = (self.client.clone(), downloadable) {
+                let events = self.events.clone();
+                let waker = self.waker.clone();
+                let story_id = id.clone();
+                let dest_path = story_file;
+                let dest_dir = dir.clone();
+                tokio::spawn(async move {
+                    let result = with_attachment_deadline(ATTACHMENT_TIMEOUT, async {
+                        download_attachment(&client, &*dl, &dest_dir, &dest_path).await
+                    }).await;
+                    match result {
+                        Ok(p) => {
+                            log::info!("Downloaded story media for {}: {:?}", story_id, p);
+                            let _ = events.send(Event::StoryMediaDownloaded {
+                                id: story_id,
+                                path: p.to_string_lossy().to_string(),
+                            });
+                            waker.wake();
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to download story media {}: {}", story_id, e);
+                        }
+                    }
+                });
             }
         }
 
@@ -3097,6 +3137,7 @@ impl Worker {
                 media_type,
                 caption,
                 thumbnail,
+                media_path,
                 viewed: from_me,
             };
             log::info!("Emitting StoryReceived: id={}, sender={}, has_text={}, media_type={:?}",
@@ -3139,6 +3180,10 @@ impl Worker {
         let mut caption = None;
         let mut thumbnail = message.thumbnail.clone();
 
+        let mut media_path = None;
+        let mut downloadable: Option<Box<dyn Downloadable>> = None;
+        let mut file_ext = "";
+
         if let Ok(wa_msg) = wa::Message::decode(&mut &message.raw[..]) {
             let base = wa_msg.get_base_message();
             if let Some(ext) = base.extended_text_message.as_option() {
@@ -3158,12 +3203,16 @@ impl Worker {
                 if img.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
                     thumbnail = img.jpeg_thumbnail.clone();
                 }
+                downloadable = Some(Box::new(img.clone()));
+                file_ext = "jpg";
             } else if let Some(vid) = base.video_message.as_option() {
                 media_type = Some(crate::stories::StoryMediaType::Video);
                 caption = vid.caption.clone().filter(|s| !s.is_empty());
                 if vid.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
                     thumbnail = vid.jpeg_thumbnail.clone();
                 }
+                downloadable = Some(Box::new(vid.clone()));
+                file_ext = "mp4";
             }
         } else {
             match &message.content {
@@ -3180,6 +3229,38 @@ impl Worker {
             }
         }
 
+        let dir = self.download_dir();
+        if !file_ext.is_empty() {
+            let story_file = dir.join(format!("story-{}.{}", message.id, file_ext));
+            if story_file.exists() {
+                media_path = Some(story_file.to_string_lossy().to_string());
+            } else if let (Some(client), Some(dl)) = (self.client.clone(), downloadable) {
+                let events = self.events.clone();
+                let waker = self.waker.clone();
+                let story_id = message.id.clone();
+                let dest_path = story_file;
+                let dest_dir = dir.clone();
+                tokio::spawn(async move {
+                    let result = with_attachment_deadline(ATTACHMENT_TIMEOUT, async {
+                        download_attachment(&client, &*dl, &dest_dir, &dest_path).await
+                    }).await;
+                    match result {
+                        Ok(p) => {
+                            log::info!("Downloaded history story media for {}: {:?}", story_id, p);
+                            let _ = events.send(Event::StoryMediaDownloaded {
+                                id: story_id,
+                                path: p.to_string_lossy().to_string(),
+                            });
+                            waker.wake();
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to download history story media {}: {}", story_id, e);
+                        }
+                    }
+                });
+            }
+        }
+
         if text.is_some() || media_type.is_some() {
             let story_item = crate::stories::StoryItem {
                 id: message.id.clone(),
@@ -3192,6 +3273,7 @@ impl Worker {
                 media_type,
                 caption,
                 thumbnail,
+                media_path,
                 viewed: from_me,
             };
             log::info!("Ingested history status from {}: id={}", story_item.sender, story_item.id);
@@ -5936,6 +6018,90 @@ impl Worker {
                             match client.status().send_image(
                                 upload,
                                 thumb,
+                                caption.as_deref(),
+                                &recipients,
+                                Default::default(),
+                            ).await {
+                                Ok(_) => {
+                                    let _ = events.send(Event::StoryPosted(Ok(())));
+                                }
+                                Err(e) => {
+                                    let _ = events.send(Event::StoryPosted(Err(e.to_string())));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::StoryPosted(Err(e.to_string())));
+                        }
+                    }
+                    waker.wake();
+                });
+            }
+            Command::PostVideoStory { path, caption } => {
+                let Some(client) = self.client.clone() else {
+                    self.emit(Event::StoryPosted(Err("Not connected to WhatsApp".into())));
+                    return;
+                };
+                let mut recipient_set = std::collections::HashSet::new();
+                if let Ok(contacts) = self.archive.contacts() {
+                    for c in contacts {
+                        if let Ok(jid) = c.id.parse::<Jid>() {
+                            if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                                recipient_set.insert(jid);
+                            }
+                        }
+                    }
+                }
+                if let Ok(chats) = self.archive.chats() {
+                    for c in chats {
+                        if c.kind == ChatKind::Direct {
+                            if let Ok(jid) = c.id.parse::<Jid>() {
+                                if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                                    recipient_set.insert(jid);
+                                }
+                            }
+                        }
+                    }
+                }
+                let recipients: Vec<Jid> = recipient_set.into_iter().collect();
+                if recipients.is_empty() {
+                    self.emit(Event::StoryPosted(Err("No contacts found to share status with".into())));
+                    return;
+                }
+                let events = self.events.clone();
+                let waker = self.waker.clone();
+                tokio::spawn(async move {
+                    let bytes = match tokio::fs::read(&path).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = events.send(Event::StoryPosted(Err(format!("Could not read video: {e}"))));
+                            waker.wake();
+                            return;
+                        }
+                    };
+                    let poster = {
+                        let bytes_clone = bytes.clone();
+                        tokio::task::spawn_blocking(move || crate::animation::poster(&bytes_clone))
+                            .await
+                            .ok()
+                            .flatten()
+                    };
+                    let thumb = poster
+                        .as_ref()
+                        .and_then(|poster| poster.picture.clone())
+                        .and_then(|picture| thumbnail_jpeg(&image::DynamicImage::ImageRgb8(picture)))
+                        .unwrap_or_default();
+                    let seconds = poster.as_ref().map(|poster| poster.seconds).unwrap_or(0);
+
+                    let upload_res = client
+                        .upload(bytes, MediaType::Video, UploadOptions::default())
+                        .await;
+                    match upload_res {
+                        Ok(upload) => {
+                            match client.status().send_video(
+                                upload,
+                                thumb,
+                                seconds,
                                 caption.as_deref(),
                                 &recipients,
                                 Default::default(),
