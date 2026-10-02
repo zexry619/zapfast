@@ -2324,10 +2324,11 @@ impl Worker {
                             }
                         }
                     });
+                    let privacy_client = client.clone();
                     tokio::spawn(async move {
-                        publish_account_privacy(&client, &commands).await;
+                        publish_account_privacy(&privacy_client, &commands).await;
                         if let Some(me) = me {
-                            match client
+                            match privacy_client
                                 .contacts()
                                 .get_user_info(std::slice::from_ref(&me))
                                 .await
@@ -2340,6 +2341,28 @@ impl Worker {
                                     let _ = commands.send(Command::MeInfo { about });
                                 }
                                 Err(error) => log::debug!("own info not fetched: {error}"),
+                            }
+                        }
+                    });
+                    let status_client = client.clone();
+                    let contacts_res = self.archive.contacts().ok();
+                    let me_pn_sub = self.me_pn.clone();
+                    let me_lid_sub = self.me_lid.clone();
+                    tokio::spawn(async move {
+                        let status_jid = Jid::status_broadcast();
+                        if let Err(e) = status_client.presence().subscribe(status_jid).await {
+                            log::warn!("failed to subscribe to status@broadcast presence: {e}");
+                        } else {
+                            log::info!("successfully subscribed to status@broadcast presence updates");
+                        }
+                        if let Some(contacts) = contacts_res {
+                            for c in contacts {
+                                if let Ok(jid) = c.id.parse::<Jid>() {
+                                    let is_me = me_pn_sub.as_deref() == Some(&c.id) || me_lid_sub.as_deref() == Some(&c.id);
+                                    if (jid.is_pn() || jid.is_lid()) && !is_me {
+                                        let _ = status_client.presence().subscribe(jid).await;
+                                    }
+                                }
                             }
                         }
                     });
@@ -3013,6 +3036,7 @@ impl Worker {
         } else {
             self.canonical(&info.source.sender)
         };
+        log::info!("Handling status broadcast: id={}, sender={}, from_me={}", info.id, sender, from_me);
         let sender_name = if from_me {
             Some("You".to_string())
         } else {
@@ -3064,6 +3088,101 @@ impl Worker {
         if text.is_some() || media_type.is_some() {
             let story_item = crate::stories::StoryItem {
                 id,
+                sender: sender.clone(),
+                sender_name,
+                timestamp,
+                text,
+                background_argb,
+                font,
+                media_type,
+                caption,
+                thumbnail,
+                viewed: from_me,
+            };
+            log::info!("Emitting StoryReceived: id={}, sender={}, has_text={}, media_type={:?}",
+                story_item.id, story_item.sender, story_item.text.is_some(), story_item.media_type);
+            self.emit(Event::StoryReceived(Box::new(story_item)));
+        } else {
+            log::debug!("Status broadcast without displayable text or media ignored: id={}", id);
+        }
+    }
+
+    fn ingest_history_status(&mut self, message: &ParsedMessage, now_secs: u64) {
+        let timestamp = message.timestamp.max(0) as u64;
+        if now_secs.saturating_sub(timestamp) > 24 * 3600 {
+            return;
+        }
+        let from_me = message.from_me;
+        let sender = if from_me {
+            self.me()
+        } else if let Some(ref sender_str) = message.sender {
+            self.canonical_str(sender_str)
+        } else {
+            return;
+        };
+        let sender_name = if from_me {
+            Some("You".to_string())
+        } else {
+            self.archive
+                .contact(&sender)
+                .ok()
+                .flatten()
+                .and_then(|c| c.display_name().map(String::from))
+                .or_else(|| self.archive.chat(&sender).ok().flatten().map(|c| c.name))
+                .or_else(|| message.push_name.clone())
+        };
+
+        let mut text = None;
+        let mut background_argb = None;
+        let mut font = None;
+        let mut media_type = None;
+        let mut caption = None;
+        let mut thumbnail = message.thumbnail.clone();
+
+        if let Ok(wa_msg) = wa::Message::decode(&mut &message.raw[..]) {
+            let base = wa_msg.get_base_message();
+            if let Some(ext) = base.extended_text_message.as_option() {
+                text = ext.text.clone();
+                background_argb = ext.background_argb;
+                font = ext.font.map(|f| f as u32);
+                if ext.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
+                    thumbnail = ext.jpeg_thumbnail.clone();
+                }
+            } else if let Some(txt) = base.conversation.as_deref() {
+                text = Some(txt.to_string());
+            }
+
+            if let Some(img) = base.image_message.as_option() {
+                media_type = Some(crate::stories::StoryMediaType::Image);
+                caption = img.caption.clone().filter(|s| !s.is_empty());
+                if img.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
+                    thumbnail = img.jpeg_thumbnail.clone();
+                }
+            } else if let Some(vid) = base.video_message.as_option() {
+                media_type = Some(crate::stories::StoryMediaType::Video);
+                caption = vid.caption.clone().filter(|s| !s.is_empty());
+                if vid.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
+                    thumbnail = vid.jpeg_thumbnail.clone();
+                }
+            }
+        } else {
+            match &message.content {
+                Content::Text { text: t, .. } => text = Some(t.clone()),
+                Content::Image { caption: c, .. } => {
+                    media_type = Some(crate::stories::StoryMediaType::Image);
+                    caption = c.clone();
+                }
+                Content::Video { caption: c, .. } => {
+                    media_type = Some(crate::stories::StoryMediaType::Video);
+                    caption = c.clone();
+                }
+                _ => {}
+            }
+        }
+
+        if text.is_some() || media_type.is_some() {
+            let story_item = crate::stories::StoryItem {
+                id: message.id.clone(),
                 sender,
                 sender_name,
                 timestamp,
@@ -3073,8 +3192,9 @@ impl Worker {
                 media_type,
                 caption,
                 thumbnail,
-                viewed: false,
+                viewed: from_me,
             };
+            log::info!("Ingested history status from {}: id={}", story_item.sender, story_item.id);
             self.emit(Event::StoryReceived(Box::new(story_item)));
         }
     }
@@ -3980,6 +4100,16 @@ impl Worker {
         }
         for mut chat in parsed.chats {
             let id = self.canonical_str(&chat.id);
+            if id == "status@broadcast" || chat.id == "status@broadcast" {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                for message in chat.messages {
+                    self.ingest_history_status(&message, now_secs);
+                }
+                continue;
+            }
             if id.ends_with("@broadcast") {
                 continue;
             }
@@ -5705,7 +5835,7 @@ impl Worker {
                 if let Ok(contacts) = self.archive.contacts() {
                     for c in contacts {
                         if let Ok(jid) = c.id.parse::<Jid>() {
-                            if !jid.is_group() && !jid.is_newsletter() {
+                            if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
                                 recipient_set.insert(jid);
                             }
                         }
@@ -5715,7 +5845,7 @@ impl Worker {
                     for c in chats {
                         if c.kind == ChatKind::Direct {
                             if let Ok(jid) = c.id.parse::<Jid>() {
-                                if !jid.is_group() && !jid.is_newsletter() {
+                                if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
                                     recipient_set.insert(jid);
                                 }
                             }
@@ -5770,7 +5900,7 @@ impl Worker {
                 if let Ok(contacts) = self.archive.contacts() {
                     for c in contacts {
                         if let Ok(jid) = c.id.parse::<Jid>() {
-                            if !jid.is_group() && !jid.is_newsletter() {
+                            if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
                                 recipient_set.insert(jid);
                             }
                         }
@@ -5780,7 +5910,7 @@ impl Worker {
                     for c in chats {
                         if c.kind == ChatKind::Direct {
                             if let Ok(jid) = c.id.parse::<Jid>() {
-                                if !jid.is_group() && !jid.is_newsletter() {
+                                if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
                                     recipient_set.insert(jid);
                                 }
                             }

@@ -159,14 +159,51 @@ fn my_status_item(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
     let item_size = vec2(54.0, 68.0);
     let (rect, response) = ui.allocate_exact_size(item_size, Sense::click());
 
+    let me_str = app.me.clone().unwrap_or_else(|| "me".to_string());
+    let my_stories = app
+        .stories
+        .stories_by_sender
+        .get("me")
+        .or_else(|| app.stories.stories_by_sender.get(&me_str))
+        .filter(|items| !items.is_empty());
+
+    let has_stories = my_stories.is_some();
+    let sender_for_viewer = if app.stories.stories_by_sender.contains_key(&me_str) {
+        me_str.clone()
+    } else {
+        "me".to_string()
+    };
+
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if response.clicked() {
-        app.actions.push(Action::OpenPostStory);
+        if has_stories {
+            app.actions.push(Action::OpenStoryViewer {
+                sender: sender_for_viewer,
+                index: 0,
+            });
+        } else {
+            app.actions.push(Action::OpenPostStory);
+        }
+    }
+
+    if has_stories {
+        response.on_hover_text("My status\nClick to view your status update\nUse '+' in header to add another");
+    } else {
+        response.on_hover_text("My status\nClick to add status update");
     }
 
     let avatar_center = pos2(rect.center().x, rect.top() + 24.0);
+
+    // If user has active stories, draw ring around avatar
+    if has_stories {
+        ui.painter().circle_stroke(
+            avatar_center,
+            24.0,
+            Stroke::new(2.2, Color32::from_rgb(0, 168, 132)),
+        );
+    }
 
     // Draw user avatar or placeholder
     let me = app.me.clone().unwrap_or_default();
@@ -174,9 +211,9 @@ fn my_status_item(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
     let picture = app.avatar(&me);
 
     ui.scope_builder(
-        egui::UiBuilder::new().max_rect(Rect::from_center_size(avatar_center, vec2(44.0, 44.0))),
+        egui::UiBuilder::new().max_rect(Rect::from_center_size(avatar_center, vec2(42.0, 42.0))),
         |ui| {
-            widgets::avatar(ui, palette, &me_name, &me, 44.0, picture.as_deref());
+            widgets::avatar(ui, palette, &me_name, &me, 42.0, picture.as_deref());
         },
     );
 
