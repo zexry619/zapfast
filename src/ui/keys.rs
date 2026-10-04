@@ -6,6 +6,16 @@ use crate::app::App;
 use crate::model::{Action, Chat, Dialog, Page, Scroll};
 
 pub fn handle(app: &mut App, ctx: &egui::Context) {
+    if app.story_viewer.is_some() {
+        story_keys(app, ctx);
+        return;
+    }
+    if app.post_story_open {
+        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+            app.actions.push(Action::ClosePostStory);
+            return;
+        }
+    }
     if app.image_preview.is_some() {
         preview_keys(app, ctx);
         return;
@@ -405,6 +415,42 @@ fn video_keys(app: &mut App, ctx: &egui::Context) {
                 egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Paste(_)
             )
         });
+    });
+    app.actions.extend(actions);
+}
+
+/// Handles keyboard inputs while the WhatsApp Status / Story viewer overlay is open.
+/// Escape closes the viewer, Left and Right arrows navigate between stories,
+/// and Space pauses or resumes playback.
+fn story_keys(app: &mut App, ctx: &egui::Context) {
+    let mut actions = Vec::new();
+    let typing_reply = app
+        .story_viewer
+        .as_ref()
+        .map_or(false, |v| !v.reply_text.is_empty())
+        || ctx.text_edit_focused();
+
+    ctx.input_mut(|input| {
+        // Escape always closes the story viewer regardless of text field focus.
+        if input.consume_key(Modifiers::NONE, Key::Escape) {
+            actions.push(Action::CloseStoryViewer);
+            return;
+        }
+        if !typing_reply {
+            if input.consume_key(Modifiers::NONE, Key::ArrowLeft) {
+                actions.push(Action::PrevStory);
+            }
+            if input.consume_key(Modifiers::NONE, Key::ArrowRight)
+                || input.consume_key(Modifiers::NONE, Key::Enter)
+            {
+                actions.push(Action::NextStory);
+            }
+            if input.consume_key(Modifiers::NONE, Key::Space) {
+                if let Some(viewer) = app.story_viewer.as_mut() {
+                    viewer.paused = !viewer.paused;
+                }
+            }
+        }
     });
     app.actions.extend(actions);
 }

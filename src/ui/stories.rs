@@ -498,62 +498,19 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
     let is_image_loading = is_image && current_item.media_path.is_none() && current_item.raw_message.is_some();
     let is_media_loading = is_video_loading || is_image_loading;
 
-    // Detect media aspect ratio (width / height)
-    let mut aspect_ratio: Option<f32> = None;
-    if is_video {
-        if let Some(ref vs) = video_status {
-            if let Some(ref frame) = vs.frame {
-                let sz = frame.size_vec2();
-                if sz.y > 0.0 {
-                    aspect_ratio = Some(sz.x / sz.y);
-                }
-            }
-        }
-    }
-    if aspect_ratio.is_none() {
-        if let Some(thumb_bytes) = &current_item.thumbnail {
-            if let Ok(img) = image::load_from_memory(thumb_bytes) {
-                if img.height() > 0 {
-                    aspect_ratio = Some(img.width() as f32 / img.height() as f32);
-                }
-            }
-        }
-    }
-
     let screen = ctx.content_rect();
     let palette = app.palette;
 
     let screen_w = screen.width();
     let screen_h = screen.height();
-    let max_card_w = (screen_w - 48.0).max(360.0);
-    let max_card_h = (screen_h - 40.0).max(380.0);
 
-    // Dynamic sizing based on media aspect ratio: full height with wide landscape support
-    let (card_width, card_height) = match aspect_ratio {
-        Some(ratio) if ratio > 1.25 => {
-            // Landscape / Widescreen media (e.g. 16:9, 4:3)
-            let target_w = (max_card_h * ratio).min(max_card_w).min(1150.0);
-            let target_h = (target_w / ratio).min(max_card_h);
-            (target_w, target_h)
-        }
-        Some(ratio) if ratio > 0.85 => {
-            // Square (1:1)
-            let target_side = max_card_h.min(max_card_w).min(780.0);
-            (target_side * ratio, target_side)
-        }
-        Some(ratio) => {
-            // Portrait phone media (e.g. 9:16)
-            let target_h = max_card_h.min(940.0);
-            let target_w = (target_h * ratio).clamp(420.0, max_card_w);
-            (target_w, target_h)
-        }
-        None => {
-            // Text status: generous portrait card
-            let target_h = max_card_h.min(860.0);
-            let target_w = (target_h * (9.0 / 16.0)).clamp(440.0, max_card_w);
-            (target_w, target_h)
-        }
-    };
+    // Fixed WhatsApp Web style portrait card (9:16 aspect ratio, centered modal)
+    // Remains strictly fixed across text, photo, and video stories without jumping
+    let target_height = (screen_h - 48.0).clamp(460.0, 880.0);
+    let target_width = (target_height * (9.0 / 16.0)).round().clamp(360.0, 500.0);
+
+    let card_width = target_width.min(screen_w - 32.0);
+    let card_height = target_height.min(screen_h - 40.0);
 
     let card_rect = Rect::from_center_size(screen.center(), vec2(card_width, card_height));
     let close_rect = Rect::from_center_size(
