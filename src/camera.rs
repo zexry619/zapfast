@@ -138,6 +138,8 @@ static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 enum Input {
     /// A V4L2 node, which is what a call passes.
     Node(String),
+    /// A display screen capture (e.g. :0 or :1) via x11grab.
+    Screen(String),
     /// An `ffmpeg` lavfi graph: no node, no camera, and a picture that really moves.
     #[cfg(test)]
     Synthetic(String),
@@ -150,6 +152,9 @@ impl Input {
         match self {
             Input::Node(device) => {
                 vec!["-f".to_owned(), "v4l2".into(), "-i".into(), device.clone()]
+            }
+            Input::Screen(display) => {
+                vec!["-f".to_owned(), "x11grab".into(), "-i".into(), display.clone()]
             }
             #[cfg(test)]
             Input::Synthetic(graph) => {
@@ -242,6 +247,17 @@ impl Source {
             Input::Node(device.to_owned()),
             || Node::open(device, budget, fps).map(Source::Node),
         )
+    }
+
+    /// Opens desktop screen capture for screen sharing via `x11grab`.
+    pub fn open_screen(
+        budget: (usize, usize),
+        fps: u32,
+        child: Arc<Mutex<Option<std::process::Child>>>,
+    ) -> Result<Self, String> {
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned());
+        log::info!("[CALL] opening screen capture on DISPLAY={display} at {budget:?} @ {fps}fps");
+        Self::start(Input::Screen(display), budget, fps, child)
     }
 
     /// The same choice with both paths under the caller's control, so the routing and the process

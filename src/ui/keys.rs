@@ -487,6 +487,7 @@ mod tests {
             started: Some(std::time::Instant::now()),
             muted: false,
             camera_on: false,
+            screen_sharing: false,
             remote_video: false,
             outcome: None,
             peer_audio: None,

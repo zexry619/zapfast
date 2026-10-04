@@ -1285,6 +1285,10 @@ pub enum Action {
     SetCallSpeaker(Option<String>),
     /// Switches the current call's camera node.
     SetCallCameraDevice(Option<String>),
+    /// Toggles screen sharing in the active video call.
+    SetCallScreenShare(bool),
+    /// Refreshes the list of available microphones, speakers, and cameras.
+    RefreshCallDevices,
     /// Opens the chat a logged call belongs to.
     OpenCallChat(ChatId),
     /// Steps away from the full call screen without ending the call.
@@ -1319,6 +1323,13 @@ pub enum Action {
     PostMediaStory {
         path: std::path::PathBuf,
         caption: Option<String>,
+    },
+    /// Replies to a WhatsApp status / story.
+    ReplyStory {
+        sender: String,
+        story_id: String,
+        text: String,
+        raw_message: Option<Vec<u8>>,
     },
     /// Creates and opens a chat for a contact without one.
     StartChat {

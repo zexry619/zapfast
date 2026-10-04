@@ -25,6 +25,8 @@ pub struct StoryItem {
     pub thumbnail: Option<Vec<u8>>,
     #[serde(default)]
     pub media_path: Option<String>,
+    #[serde(default)]
+    pub raw_message: Option<Vec<u8>>,
     pub viewed: bool,
 }
 
@@ -186,6 +188,7 @@ mod tests {
             caption: None,
             thumbnail: None,
             media_path: None,
+            raw_message: None,
             viewed: false,
         });
 
@@ -201,6 +204,7 @@ mod tests {
             caption: None,
             thumbnail: None,
             media_path: None,
+            raw_message: None,
             viewed: false,
         });
 
@@ -234,6 +238,7 @@ mod tests {
             caption: None,
             thumbnail: None,
             media_path: None,
+            raw_message: None,
             viewed: false,
         });
         store.add(StoryItem {
@@ -248,6 +253,7 @@ mod tests {
             caption: None,
             thumbnail: None,
             media_path: None,
+            raw_message: None,
             viewed: false,
         });
         store.add(StoryItem {
@@ -262,6 +268,7 @@ mod tests {
             caption: None,
             thumbnail: None,
             media_path: None,
+            raw_message: None,
             viewed: false,
         });
 

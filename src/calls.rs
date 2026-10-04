@@ -13,8 +13,8 @@
 //! Frames cross to the UI through [`VideoTick`]; no decode work happens on the UI thread.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use egui::ColorImage;
@@ -42,18 +42,11 @@ const PREVIEW_LONG_SIDE: usize = 320;
 const PREVIEW_SHORT_SIDE: usize = 180;
 /// The cadence the camera is asked for and the encoder is built for.
 ///
-/// Thirty frames a second is the difference between a picture that moves and one that steps: at
-/// fifteen the peer sees every gesture twice. A camera that grants fewer frames is used at what it
-/// gives, and the frames carry their own capture times, so nothing plays back at the wrong speed.
+/// Thirty frames a second matches native USB camera sensor timing (V4L2 33.3ms intervals).
+/// Frames carry their own monotonic RTP capture timestamps via TimedVideoFrame so playback timing is exact.
 const VIDEO_FPS: u32 = 30;
-/// RTP video clock (90 kHz) divided by the capture cadence.
+/// RTP video clock (90 kHz) divided by the capture cadence (3000 at 30 fps).
 const VIDEO_TS_STRIDE: u32 = 90_000 / VIDEO_FPS;
-/// The encoder's bitrate for the budget above.
-///
-/// Two and a half megabits a second is a normal 720p30 1:1 call: enough for a face and the room
-/// around it to stay sharp at that size, and low enough to fit the uplink a call has to share with
-/// its own audio.
-const VIDEO_BITRATE: u32 = 2_500_000;
 
 // ---------------------------------------------------------------------------
 // State
@@ -181,6 +174,8 @@ pub struct CallUpdate {
     pub started: Option<Instant>,
     pub muted: bool,
     pub camera_on: bool,
+    /// Whether the user is sharing their screen.
+    pub screen_sharing: bool,
     /// Whether the peer's picture has started arriving.
     pub remote_video: bool,
     /// How the call ended, once it has. Worded by the call screen, stored by the call history.
@@ -332,17 +327,9 @@ pub fn resolve_devices(
     }
 }
 
-/// Whether the call surface may offer 1:1 screen sharing.
-///
-/// It may not, at the revision this app pins, so the button says so instead of pretending.
-/// `CallHandle::start_screen_share` reaches `Voip::set_screen_share_for_generation`, which requires
-/// `CallRegistry::group_creator_matches_if_current` — an *active group* call (`entry.is_group_call`)
-/// whose creator matches. A direct 1:1 call has no group state, so the call is refused with
-/// `CallError::Media("call creator does not match the active group call")`. The protocol crate
-/// carries `<screen_share>` for group calls only, so a Wayland portal capture would produce frames
-/// with no 1:1 signaling to carry them.
+/// Whether the call surface may offer screen sharing.
 pub const fn screen_share_supported() -> bool {
-    false
+    true
 }
 
 /// Scales `size` to the largest even size with the same aspect that fits `bounds`, never upscaling.
@@ -551,13 +538,15 @@ fn require_video(requested: bool, pipeline: bool) -> Result<()> {
 // Video
 // ---------------------------------------------------------------------------
 
-/// One frame on its way to the UI.
+/// One frame on its way to the UI, or a signaling request from the decoder.
 #[derive(Clone, Debug)]
 pub enum VideoTick {
     /// Our own camera, for the corner preview.
     Local(Arc<ColorImage>),
     /// The peer's picture.
     Remote(Arc<ColorImage>),
+    /// Inbound decoder detected loss or decode failure: requests an immediate peer IDR keyframe.
+    NeedsKeyframe,
 }
 
 /// The camera side of the call: the camera module reads YUV 4:2:0 at a fixed size, so the encoder
@@ -567,10 +556,13 @@ pub enum VideoTick {
 /// A device change starts a fresh thread rather than telling this one to switch: a running encoder
 /// carries state the new device's stream cannot inherit.
 struct CameraCapture {
-    timed: async_channel::Receiver<TimedVideoFrame>,
     /// Cleared when the camera is no longer wanted, and read by the capture loop between reads, so
     /// a stopped camera ends without waiting for a frame that may never come.
     running: Arc<AtomicBool>,
+    /// Set when the engine or peer requests an IDR keyframe.
+    force_keyframe: Arc<AtomicBool>,
+    /// Dynamically adjusted target bitrate in bps (controlled by BWE / RTCP feedback).
+    target_bitrate: Arc<AtomicU32>,
     /// The capture child, shared with the camera module that owns it. On the fallback path the
     /// read is a blocking `read_exact` on the child's stdout, so ending it without a frame means
     /// killing the process, which closes that pipe and returns the thread. Without this, a camera
@@ -591,7 +583,11 @@ struct CameraCapture {
 const CAMERA_STARTUP: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl CameraCapture {
-    fn start(device: Option<String>, ticks: async_channel::Sender<VideoTick>) -> Result<Self> {
+    fn start(
+        device: Option<String>,
+        ticks: async_channel::Sender<VideoTick>,
+        timed: async_channel::Sender<TimedVideoFrame>,
+    ) -> Result<Self> {
         // Refuse a camera that cannot be opened before any signaling, rather than spawning a
         // thread that exits and sends a video call with no local picture: `capture` treats a
         // missing device as "no camera" and returns, which would otherwise pass silently.
@@ -604,27 +600,28 @@ impl CameraCapture {
         if !captures(&device) {
             return Err(anyhow!("{device} is not a usable camera"));
         }
-        let (frames, timed) = async_channel::bounded::<TimedVideoFrame>(4);
         let running = Arc::new(AtomicBool::new(true));
+        let force_keyframe = Arc::new(AtomicBool::new(true));
+        let target_bitrate = Arc::new(AtomicU32::new(0));
         let child = Arc::new(std::sync::Mutex::new(None));
-        // The capture thread reports whether the camera and the encoder really came up. Returning
-        // success the moment the thread is spawned would let a busy camera, a missing fallback or an
-        // encoder that will not initialize signal a video call with no outgoing picture at all.
         let (ready, came_up) = std::sync::mpsc::channel::<Result<(), String>>();
         let alive = CaptureAlive(Arc::clone(&running));
         let slot = Arc::clone(&child);
         let stopping = Arc::clone(&running);
+        let keyframing = Arc::clone(&force_keyframe);
+        let bitrates = Arc::clone(&target_bitrate);
         let thread = std::thread::Builder::new()
             .name("zapfast-camera".to_owned())
             .spawn(move || {
                 let _alive = alive;
-                capture(Some(device), frames, ticks, slot, stopping, ready);
+                capture(Some(device), timed, ticks, slot, stopping, keyframing, bitrates, ready);
             })
             .context("camera thread could not be started")?;
         match came_up.recv_timeout(CAMERA_STARTUP) {
             Ok(Ok(())) => Ok(Self {
-                timed,
                 running,
+                force_keyframe,
+                target_bitrate,
                 child,
                 thread: Some(thread),
             }),
@@ -635,12 +632,54 @@ impl CameraCapture {
                 Err(anyhow!(error))
             }
             Err(_) => {
-                // The camera did not come up in time: end it here rather than leave the thread and
-                // any child behind for the next call to race.
                 running.store(false, Ordering::Relaxed);
                 kill_camera_child(&child);
                 let _ = thread.join();
                 Err(anyhow!("the camera did not start in time"))
+            }
+        }
+    }
+
+    fn start_screen(
+        ticks: async_channel::Sender<VideoTick>,
+        timed: async_channel::Sender<TimedVideoFrame>,
+    ) -> Result<Self> {
+        let running = Arc::new(AtomicBool::new(true));
+        let force_keyframe = Arc::new(AtomicBool::new(true));
+        let target_bitrate = Arc::new(AtomicU32::new(0));
+        let child = Arc::new(std::sync::Mutex::new(None));
+        let (ready, came_up) = std::sync::mpsc::channel::<Result<(), String>>();
+        let alive = CaptureAlive(Arc::clone(&running));
+        let slot = Arc::clone(&child);
+        let stopping = Arc::clone(&running);
+        let keyframing = Arc::clone(&force_keyframe);
+        let bitrates = Arc::clone(&target_bitrate);
+        let thread = std::thread::Builder::new()
+            .name("zapfast-screenshare".to_owned())
+            .spawn(move || {
+                let _alive = alive;
+                capture_screen(timed, ticks, slot, stopping, keyframing, bitrates, ready);
+            })
+            .context("screenshare thread could not be started")?;
+        match came_up.recv_timeout(CAMERA_STARTUP) {
+            Ok(Ok(())) => Ok(Self {
+                running,
+                force_keyframe,
+                target_bitrate,
+                child,
+                thread: Some(thread),
+            }),
+            Ok(Err(error)) => {
+                running.store(false, Ordering::Relaxed);
+                kill_camera_child(&child);
+                let _ = thread.join();
+                Err(anyhow!(error))
+            }
+            Err(_) => {
+                running.store(false, Ordering::Relaxed);
+                kill_camera_child(&child);
+                let _ = thread.join();
+                Err(anyhow!("the screen capture did not start in time"))
             }
         }
     }
@@ -656,6 +695,14 @@ impl CameraCapture {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+
+    fn request_keyframe(&self) {
+        self.force_keyframe.store(true, Ordering::Relaxed);
+    }
+
+    fn set_target_bitrate(&self, bitrate: u32) {
+        self.target_bitrate.store(bitrate, Ordering::Relaxed);
     }
 
     fn running(&self) -> bool {
@@ -697,7 +744,6 @@ impl Drop for CaptureAlive {
 /// The `VideoSource` the engine pulls access units from.
 struct LocalVideoSource {
     timed: async_channel::Receiver<TimedVideoFrame>,
-    /// Never fed: the engine uses the timestamped channel above.
     empty: async_channel::Receiver<Vec<u8>>,
 }
 
@@ -730,42 +776,44 @@ impl VideoSink for RemoteVideoSink {
 pub struct VideoPipeline {
     ticks: async_channel::Sender<VideoTick>,
     remote_tx: async_channel::Sender<VideoFrame>,
+    timed_tx: async_channel::Sender<TimedVideoFrame>,
+    timed_rx: async_channel::Receiver<TimedVideoFrame>,
+    empty_rx: async_channel::Receiver<Vec<u8>>,
     camera: Option<CameraCapture>,
     device: Option<String>,
+    is_screen_sharing: bool,
 }
 
 impl VideoPipeline {
     /// Starts the camera and the peer's decoder. The returned receiver carries both directions'
     /// frames to the UI.
     pub fn start(device: Option<String>) -> Result<(Self, async_channel::Receiver<VideoTick>)> {
-        let (ticks, tick_rx) = async_channel::bounded::<VideoTick>(2);
-        let (remote_tx, remote_rx) = async_channel::bounded::<VideoFrame>(8);
+        let (ticks, tick_rx) = async_channel::bounded::<VideoTick>(32);
+        let (remote_tx, remote_rx) = async_channel::bounded::<VideoFrame>(32);
+        let (timed_tx, timed_rx) = async_channel::bounded::<TimedVideoFrame>(64);
+        let (_empty_tx, empty_rx) = async_channel::bounded::<Vec<u8>>(1);
         decode_remote(remote_rx, ticks.clone());
-        let camera = CameraCapture::start(device.clone(), ticks.clone())?;
+        let camera = CameraCapture::start(device.clone(), ticks.clone(), timed_tx.clone())?;
         Ok((
             Self {
                 ticks,
                 remote_tx,
+                timed_tx,
+                timed_rx,
+                empty_rx,
                 camera: Some(camera),
                 device,
+                is_screen_sharing: false,
             },
             tick_rx,
         ))
     }
 
     fn source(&self) -> LocalVideoSource {
-        let (empty_tx, empty) = async_channel::bounded::<Vec<u8>>(1);
-        drop(empty_tx);
-        let timed = match &self.camera {
-            Some(camera) => camera.timed.clone(),
-            // No camera running: a closed timestamped channel, so the feed simply sees no frames.
-            None => {
-                let (unused, closed) = async_channel::bounded::<TimedVideoFrame>(1);
-                drop(unused);
-                closed
-            }
-        };
-        LocalVideoSource { timed, empty }
+        LocalVideoSource {
+            timed: self.timed_rx.clone(),
+            empty: self.empty_rx.clone(),
+        }
     }
 
     fn sink(&self) -> RemoteVideoSink {
@@ -787,8 +835,35 @@ impl VideoPipeline {
             camera.stop();
         }
         self.device = device.clone();
-        self.camera = Some(CameraCapture::start(device, self.ticks.clone())?);
+        self.is_screen_sharing = false;
+        self.camera = Some(CameraCapture::start(device, self.ticks.clone(), self.timed_tx.clone())?);
         Ok(())
+    }
+
+    /// Toggles screen sharing on the active video plane.
+    pub fn set_screen_sharing(&mut self, on: bool) -> Result<()> {
+        if self.is_screen_sharing == on {
+            return Ok(());
+        }
+        if let Some(mut camera) = self.camera.take() {
+            camera.stop();
+        }
+        if on {
+            log::info!("[CALL] switching local video stream to Screen Share");
+            self.camera = Some(CameraCapture::start_screen(self.ticks.clone(), self.timed_tx.clone())?);
+            self.is_screen_sharing = true;
+        } else {
+            log::info!("[CALL] switching local video stream to Camera ({:?})", self.device);
+            self.camera = Some(CameraCapture::start(self.device.clone(), self.ticks.clone(), self.timed_tx.clone())?);
+            self.is_screen_sharing = false;
+        }
+        self.request_keyframe();
+        Ok(())
+    }
+
+    /// Whether the local video plane is currently transmitting the desktop screen.
+    pub fn is_screen_sharing(&self) -> bool {
+        self.is_screen_sharing
     }
 
     /// Whether the camera is capturing right now. A capture thread that ended — an unplugged
@@ -797,11 +872,40 @@ impl VideoPipeline {
         self.camera.as_ref().is_some_and(CameraCapture::running)
     }
 
+    /// Forces the local camera encoder to emit an IDR keyframe on its next frame.
+    pub fn request_keyframe(&self) {
+        if let Some(camera) = self.camera.as_ref() {
+            camera.request_keyframe();
+        }
+    }
+
+    /// Sets a dynamic target bitrate for the local camera encoder.
+    pub fn set_target_bitrate(&self, bitrate: u32) {
+        if let Some(camera) = self.camera.as_ref() {
+            camera.set_target_bitrate(bitrate);
+        }
+    }
+
     /// Ends the video direction: the capture thread stops and the child is reaped.
     pub fn shutdown(&mut self) {
         if let Some(mut camera) = self.camera.take() {
             camera.stop();
         }
+    }
+}
+
+/// Baseline video bitrate based on resolution for real-time mobile VoIP.
+/// Baseline video bitrate based on resolution for real-time mobile VoIP.
+pub fn target_bitrate_for_size(width: usize, height: usize) -> u32 {
+    let pixels = width * height;
+    if pixels >= 1280 * 720 {
+        900_000   // 900 kbps for 720p HD
+    } else if pixels >= 800 * 600 {
+        650_000   // 650 kbps for SVGA
+    } else if pixels >= 640 * 360 {
+        450_000   // 450 kbps for 360p/VGA (resilient, clear, smooth 30 fps)
+    } else {
+        280_000   // 280 kbps for lower resolutions
     }
 }
 
@@ -816,10 +920,13 @@ fn capture(
     ticks: async_channel::Sender<VideoTick>,
     child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
     stopping: Arc<AtomicBool>,
+    force_keyframe: Arc<AtomicBool>,
+    target_bitrate: Arc<AtomicU32>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     use openh264::encoder::{
-        BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile,
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile,
+        QpRange, RateControlMode, UsageType,
     };
 
     let Some(device) = device else {
@@ -842,12 +949,18 @@ fn capture(
         }
     };
     let size = source.size();
+    let bitrate = target_bitrate_for_size(size.0, size.1);
+    target_bitrate.store(bitrate, Ordering::Relaxed);
     let config = EncoderConfig::new()
         .profile(Profile::Baseline)
-        .bitrate(BitRate::from_bps(VIDEO_BITRATE))
+        .bitrate(BitRate::from_bps(bitrate))
         .max_frame_rate(FrameRate::from_hz(VIDEO_FPS as f32))
         .intra_frame_period(IntraFramePeriod::from_num_frames(VIDEO_FPS * 2))
-        .skip_frames(false);
+        .rate_control_mode(RateControlMode::Bitrate)
+        .usage_type(UsageType::CameraVideoRealTime)
+        .complexity(Complexity::Low)
+        .qp(QpRange::new(24, 42))
+        .skip_frames(true);
     let mut encoder = match Encoder::with_api_config(openh264::OpenH264API::from_source(), config) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -867,13 +980,77 @@ fn capture(
         &mut source,
         size,
         &stopping,
+        &force_keyframe,
+        &target_bitrate,
         &timed,
         &ticks,
         &mut encoder,
-        Instant::now(),
     );
     // Whatever ended the loop, the source is done with and its child, if it started one, is reaped
     // rather than left for the next call to race.
+    source.reap();
+}
+
+/// Captures from desktop screen, encodes each frame using screen content profile, and feeds the preview and peer stream.
+fn capture_screen(
+    timed: async_channel::Sender<TimedVideoFrame>,
+    ticks: async_channel::Sender<VideoTick>,
+    child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    stopping: Arc<AtomicBool>,
+    force_keyframe: Arc<AtomicBool>,
+    target_bitrate: Arc<AtomicU32>,
+    ready: std::sync::mpsc::Sender<Result<(), String>>,
+) {
+    use openh264::encoder::{
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile,
+        QpRange, RateControlMode, UsageType,
+    };
+
+    let budget = (1280, 720);
+    let mut source = match crate::camera::Source::open_screen(budget, VIDEO_FPS, child) {
+        Ok(source) => source,
+        Err(error) => {
+            log::error!("[CALL] screen capture could not start: {error}");
+            let _ = ready.send(Err(format!("the screen could not be captured: {error}")));
+            return;
+        }
+    };
+    let size = source.size();
+    let bitrate = 800_000;
+    target_bitrate.store(bitrate, Ordering::Relaxed);
+    let config = EncoderConfig::new()
+        .profile(Profile::Baseline)
+        .bitrate(BitRate::from_bps(bitrate))
+        .max_frame_rate(FrameRate::from_hz(VIDEO_FPS as f32))
+        .intra_frame_period(IntraFramePeriod::from_num_frames(VIDEO_FPS * 2))
+        .rate_control_mode(RateControlMode::Bitrate)
+        .usage_type(UsageType::ScreenContentRealTime)
+        .complexity(Complexity::Low)
+        .qp(QpRange::new(20, 38))
+        .skip_frames(true);
+    let mut encoder = match Encoder::with_api_config(openh264::OpenH264API::from_source(), config) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            log::error!("[CALL] screen encoder could not start: {error}");
+            source.stop();
+            source.reap();
+            ticks.close();
+            let _ = ready.send(Err(format!("the screen encoder could not start: {error}")));
+            return;
+        }
+    };
+    let _ = ready.send(Ok(()));
+
+    capture_frames(
+        &mut source,
+        size,
+        &stopping,
+        &force_keyframe,
+        &target_bitrate,
+        &timed,
+        &ticks,
+        &mut encoder,
+    );
     source.reap();
 }
 
@@ -883,34 +1060,122 @@ fn capture(
 /// owns the device: a device change starts a new thread with a new encoder rather than handing a
 /// mid-stream encoder to another device's frames. `size` is what the source delivers, which is the
 /// size the driver granted, so nothing here scales or crops.
+/// Finds NAL unit boundaries in an Annex-B stream and yields `(nal_type, nal_slice_with_start_code)`.
+fn split_annexb_nal_units(data: &[u8]) -> Vec<(u8, &[u8])> {
+    let mut units = Vec::new();
+    let len = data.len();
+    let mut i = 0;
+    let mut starts = Vec::new();
+
+    while i + 2 < len {
+        if data[i] == 0 && data[i + 1] == 0 {
+            if data[i + 2] == 1 {
+                let start = if i > 0 && data[i - 1] == 0 { i - 1 } else { i };
+                starts.push((start, i + 3));
+                i += 3;
+                continue;
+            } else if i + 3 < len && data[i + 2] == 0 && data[i + 3] == 1 {
+                starts.push((i, i + 4));
+                i += 4;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    for (idx, &(start, payload_start)) in starts.iter().enumerate() {
+        let end = if idx + 1 < starts.len() {
+            starts[idx + 1].0
+        } else {
+            len
+        };
+        if payload_start < len {
+            let ntype = data[payload_start] & 0x1f;
+            units.push((ntype, &data[start..end]));
+        }
+    }
+
+    units
+}
+
 fn capture_frames(
     source: &mut crate::camera::Source,
     size: (usize, usize),
     stopping: &AtomicBool,
+    force_keyframe: &AtomicBool,
+    target_bitrate: &AtomicU32,
     timed: &async_channel::Sender<TimedVideoFrame>,
     ticks: &async_channel::Sender<VideoTick>,
     encoder: &mut openh264::encoder::Encoder,
-    started: Instant,
 ) {
     let (width, height) = size;
     let (luma_len, chroma_len) = (width * height, width * height / 4);
     let mut bytes = vec![0u8; luma_len + chroma_len * 2];
-    log::info!("[CALL] camera enabled size={width}x{height}");
+    let mut sec_timer = Instant::now();
+    let mut current_bitrate = target_bitrate.load(Ordering::Relaxed);
+    let mut frames_in_sec: u32 = 0;
+    let mut read_us_acc: u64 = 0;
+    let mut enc_us_acc: u64 = 0;
+    let mut conv_us_acc: u64 = 0;
+    let mut drops_in_sec: u32 = 0;
+    let mut au_bytes_acc: u64 = 0;
+
+    // Monotonic start timer for 90 kHz RTP capture timestamps:
+    let started = Instant::now();
+
+    // Cache latest SPS and PPS NALs to guarantee every IDR keyframe has repeated headers:
+    let mut cached_sps: Option<Vec<u8>> = None;
+    let mut cached_pps: Option<Vec<u8>> = None;
+
+    log::info!(
+        "[CALL][CAM] capture thread started size={width}x{height} fps={VIDEO_FPS} target_bitrate={}",
+        target_bitrate_for_size(width, height)
+    );
+
     loop {
         // Checked before each read, not only between them: a read returns every poll window even
         // when the camera has no frame for it, so a stop is honoured while the device is held.
         if !stopping.load(Ordering::Relaxed) {
             source.stop();
-            log::info!("[CALL] camera disabled");
+            log::info!("[CALL][CAM] camera disabled");
             return;
         }
+
+        let t_read_start = Instant::now();
         match source.read(&mut bytes) {
             crate::camera::Read::Frame => {}
             // Nothing this poll: go round and re-check whether the camera is still wanted.
             crate::camera::Read::Idle => continue,
             crate::camera::Read::Ended => {
-                log::warn!("[CALL] the camera stopped delivering frames");
+                log::warn!("[CALL][CAM] the camera stopped delivering frames");
                 return;
+            }
+        }
+        let read_dur = t_read_start.elapsed();
+        read_us_acc += read_dur.as_micros() as u64;
+        if read_dur.as_millis() > 60 {
+            log::warn!("[CALL][CAM] slow camera read: took {}ms", read_dur.as_millis());
+        }
+
+        let desired_bitrate = target_bitrate.load(Ordering::Relaxed);
+        if desired_bitrate != current_bitrate && desired_bitrate > 0 {
+            let mut info = openh264_sys2::SBitrateInfo {
+                iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
+                iBitrate: desired_bitrate as i32,
+            };
+            unsafe {
+                let res = encoder.raw_api().set_option(
+                    openh264_sys2::ENCODER_OPTION_BITRATE,
+                    std::ptr::addr_of_mut!(info).cast(),
+                );
+                if res == 0 {
+                    log::info!(
+                        "[CALL][CAM] dynamically adapted encoder bitrate from {}kbps to {}kbps",
+                        current_bitrate / 1000,
+                        desired_bitrate / 1000
+                    );
+                    current_bitrate = desired_bitrate;
+                }
             }
         }
 
@@ -923,26 +1188,85 @@ fn capture_frames(
             v: chroma_v,
             size,
         };
-        match encoder.encode(&planes) {
-            Ok(stream) => {
-                // One access unit per encoded frame, led by an access-unit delimiter so the
-                // peer's depacketizer sees the boundaries an encoder would have produced.
-                let mut unit = vec![0x00, 0x00, 0x00, 0x01, 0x09, 0xF0];
-                stream.write_vec(&mut unit);
-                let elapsed = started.elapsed().as_micros() as u64;
-                let timestamp = (elapsed * 90 / 1000) as u32;
-                // A full queue means the wire is behind: dropping is the documented answer for
-                // video, and the next frame carries the picture forward anyway.
-                let _ = timed.try_send(
-                    TimedVideoFrame::builder()
-                        .data(unit)
-                        .timestamp(timestamp)
-                        .build(),
-                );
-            }
-            Err(error) => log::warn!("[CALL] camera frame could not be encoded: {error}"),
+
+        if force_keyframe.swap(false, Ordering::Relaxed) {
+            encoder.force_intra_frame();
+            log::info!("[CALL][CAM] forced IDR keyframe");
         }
 
+        let t_enc_start = Instant::now();
+        match encoder.encode(&planes) {
+            Ok(stream) => {
+                let mut raw_stream = Vec::new();
+                stream.write_vec(&mut raw_stream);
+
+                let nals = split_annexb_nal_units(&raw_stream);
+                let mut has_idr = false;
+                let mut has_sps = false;
+                let mut has_pps = false;
+
+                for (ntype, nal_bytes) in &nals {
+                    match *ntype {
+                        7 => {
+                            has_sps = true;
+                            cached_sps = Some(nal_bytes.to_vec());
+                        }
+                        8 => {
+                            has_pps = true;
+                            cached_pps = Some(nal_bytes.to_vec());
+                        }
+                        5 => {
+                            has_idr = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Construct full Annex-B Access Unit with AUD:
+                let mut unit = vec![0x00, 0x00, 0x00, 0x01, 0x09, 0xF0];
+
+                // Ensure repeated SPS and PPS on every IDR keyframe:
+                if has_idr {
+                    if !has_sps && let Some(sps) = &cached_sps {
+                        unit.extend_from_slice(sps);
+                    }
+                    if !has_pps && let Some(pps) = &cached_pps {
+                        unit.extend_from_slice(pps);
+                    }
+                }
+
+                unit.extend_from_slice(&raw_stream);
+                if has_idr {
+                    log::info!(
+                        "[CALL][CAM] keyframe: {} bytes, {} NALs (sps={}, pps={})",
+                        unit.len(),
+                        nals.len(),
+                        has_sps,
+                        has_pps
+                    );
+                }
+                au_bytes_acc += unit.len() as u64;
+
+                // Only send to the network if actual video NAL slices were encoded (more than just AUD header):
+                if unit.len() > 6 {
+                    let elapsed = started.elapsed().as_micros() as u64;
+                    let timestamp = (elapsed * 90 / 1000) as u32;
+                    let frame = TimedVideoFrame::builder().data(unit).timestamp(timestamp).build();
+                    if timed.try_send(frame).is_err() {
+                        drops_in_sec += 1;
+                        log::warn!("[CALL][CAM] outbound video channel full: frame dropped");
+                    }
+                }
+            }
+            Err(error) => log::warn!("[CALL][CAM] camera frame could not be encoded: {error}"),
+        }
+        let enc_dur = t_enc_start.elapsed();
+        enc_us_acc += enc_dur.as_micros() as u64;
+        if enc_dur.as_millis() > 30 {
+            log::warn!("[CALL][CAM] slow h264 encode: took {}ms", enc_dur.as_millis());
+        }
+
+        let t_conv_start = Instant::now();
         let image = crate::video::rgb_image(
             luma,
             chroma_u,
@@ -955,6 +1279,28 @@ fn capture_frames(
             0,
         );
         let _ = ticks.try_send(VideoTick::Local(Arc::new(image)));
+        let conv_dur = t_conv_start.elapsed();
+        conv_us_acc += conv_dur.as_micros() as u64;
+
+        frames_in_sec += 1;
+        if sec_timer.elapsed() >= Duration::from_secs(1) {
+            let dur = sec_timer.elapsed().as_secs_f32();
+            let fps = frames_in_sec as f32 / dur;
+            let avg_read_ms = (read_us_acc as f32 / frames_in_sec.max(1) as f32) / 1000.0;
+            let avg_enc_ms = (enc_us_acc as f32 / frames_in_sec.max(1) as f32) / 1000.0;
+            let avg_preview_ms = (conv_us_acc as f32 / frames_in_sec.max(1) as f32) / 1000.0;
+            let kbps = (au_bytes_acc as f32 * 8.0 / dur) / 1000.0;
+            log::info!(
+                "[CALL][CAM] fps={fps:.1} read={avg_read_ms:.1}ms enc={avg_enc_ms:.1}ms prev={avg_preview_ms:.1}ms rate={kbps:.0}kbps dropped={drops_in_sec}"
+            );
+            sec_timer = Instant::now();
+            frames_in_sec = 0;
+            read_us_acc = 0;
+            enc_us_acc = 0;
+            conv_us_acc = 0;
+            drops_in_sec = 0;
+            au_bytes_acc = 0;
+        }
     }
 }
 
@@ -988,10 +1334,24 @@ impl openh264::formats::YUVSource for Yuv420<'_> {
     }
 }
 
+/// Helper to initialize an OpenH264 decoder with error concealment enabled.
+fn init_remote_decoder() -> Option<openh264::decoder::Decoder> {
+    let mut decoder = openh264::decoder::Decoder::new().ok()?;
+    unsafe {
+        let mut ec = openh264_sys2::ERROR_CON_SLICE_COPY as i32;
+        let _ = decoder.raw_api().set_option(
+            openh264_sys2::DECODER_OPTION_ERROR_CON_IDC,
+            std::ptr::from_mut(&mut ec).cast(),
+        );
+    }
+    Some(decoder)
+}
+
 /// Decodes the peer's access units into pictures for the UI.
 ///
 /// A decoder cannot start on a delta frame, so frames are skipped until the sink marks one as a
-/// keyframe. Runs on its own thread for the same reason the encoder does.
+/// keyframe. Incoming frames are decoded immediately on the decoder thread and delivered directly
+/// to the UI thread for zero-latency, smooth playout without artificial sleep jitter.
 fn decode_remote(
     frames: async_channel::Receiver<VideoFrame>,
     ticks: async_channel::Sender<VideoTick>,
@@ -999,59 +1359,160 @@ fn decode_remote(
     let spawned = std::thread::Builder::new()
         .name("zapfast-remote-video".to_owned())
         .spawn(move || {
-            use openh264::formats::YUVSource as _;
-
-            let mut decoder = openh264::decoder::Decoder::new().ok();
+            let mut decoder = init_remote_decoder();
             let mut started = false;
+            let mut consecutive_errors: u32 = 0;
             let mut last_orientation = 0u8;
+            let mut last_keyframe_request = Instant::now() - Duration::from_secs(1);
+
+            let mut sec_timer = Instant::now();
+            let mut frames_in_sec: u32 = 0;
+            let mut decode_us_acc: u64 = 0;
+            let mut conv_us_acc: u64 = 0;
+            let mut undecodable_in_sec: u32 = 0;
+            let mut ticks_dropped: u32 = 0;
+            let mut in_bytes_acc: u64 = 0;
+            let mut cur_size = (0usize, 0usize);
+
+            log::info!("[CALL][REMOTE] decoder thread started");
+
             while let Ok(frame) = frames.recv_blocking() {
+                in_bytes_acc += frame.data.len() as u64;
                 if !started {
                     if !frame.keyframe {
+                        if last_keyframe_request.elapsed() >= Duration::from_millis(250) {
+                            last_keyframe_request = Instant::now();
+                            let _ = ticks.try_send(VideoTick::NeedsKeyframe);
+                            log::info!("[CALL][REMOTE] requested initial peer keyframe (waiting for IDR)");
+                        }
                         continue;
                     }
                     started = true;
+                    log::info!(
+                        "[CALL][REMOTE] first keyframe received ({} bytes), starting playback",
+                        frame.data.len()
+                    );
+                } else if frame.keyframe {
+                    log::info!("[CALL][REMOTE] peer keyframe received: {} bytes", frame.data.len());
                 }
-                let Some(decoder) = decoder.as_mut() else {
+
+                let Some(decoder_ref) = decoder.as_mut() else {
                     return;
                 };
-                // The peer's camera rotation, which the frames carry so a phone held upright arrives
-                // upright. It rides the same bits on a keyframe and on a delta frame, and a peer
-                // that turns its phone changes it mid-call, so it is read per frame rather than once.
+
                 let orientation = frame.orientation & 0x03;
                 if orientation != last_orientation {
                     last_orientation = orientation;
                     log::info!(
-                        "[CALL] remote camera orientation is {} degrees",
+                        "[CALL][REMOTE] camera orientation changed to {} degrees",
                         orientation as u32 * 90
                     );
                 }
                 let turns = crate::video::orientation_turns(orientation);
-                match decoder.decode(&frame.data) {
-                    Ok(Some(decoded)) => {
-                        let (width, height) = decoded.dimensions();
-                        if width == 0 || height == 0 {
-                            continue;
-                        }
+
+                let t_dec_start = Instant::now();
+                let mut dst = [std::ptr::null_mut::<u8>(); 3];
+                let mut buffer_info = openh264_sys2::SBufferInfo::default();
+                let state = unsafe {
+                    decoder_ref.raw_api().decode_frame_no_delay(
+                        frame.data.as_ptr(),
+                        frame.data.len() as std::os::raw::c_int,
+                        std::ptr::from_mut(&mut dst).cast(),
+                        &raw mut buffer_info,
+                    )
+                };
+
+                // If no picture ready immediately, check if a completed picture can be flushed:
+                if buffer_info.iBufferStatus == 0 {
+                    let _ = unsafe {
+                        decoder_ref.raw_api().flush_frame(
+                            std::ptr::from_mut(&mut dst).cast(),
+                            &raw mut buffer_info,
+                        )
+                    };
+                }
+
+                let dec_dur = t_dec_start.elapsed();
+                decode_us_acc += dec_dur.as_micros() as u64;
+
+                if buffer_info.iBufferStatus == 1
+                    && !dst[0].is_null()
+                    && !dst[1].is_null()
+                    && !dst[2].is_null()
+                {
+                    let sys = unsafe { buffer_info.UsrData.sSystemBuffer };
+                    let width = sys.iWidth as usize;
+                    let height = sys.iHeight as usize;
+                    let y_stride = sys.iStride[0] as usize;
+                    let uv_stride = sys.iStride[1] as usize;
+
+                    if width > 0 && height > 0 && y_stride >= width && uv_stride >= width / 2 {
+                        cur_size = (width, height);
+                        let t_conv_start = Instant::now();
+                        let y = unsafe { std::slice::from_raw_parts(dst[0], height * y_stride) };
+                        let u = unsafe { std::slice::from_raw_parts(dst[1], (height / 2) * uv_stride) };
+                        let v = unsafe { std::slice::from_raw_parts(dst[2], (height / 2) * uv_stride) };
+
                         let image = crate::video::rgb_image(
-                            decoded.y(),
-                            decoded.u(),
-                            decoded.v(),
-                            decoded.strides(),
+                            y,
+                            u,
+                            v,
+                            (y_stride, uv_stride, uv_stride),
                             (width, height),
                             (width, height),
                             turns,
                         );
-                        let _ = ticks.try_send(VideoTick::Remote(Arc::new(image)));
+                        let conv_dur = t_conv_start.elapsed();
+                        conv_us_acc += conv_dur.as_micros() as u64;
+
+                        let image = Arc::new(image);
+                        if ticks.try_send(VideoTick::Remote(image)).is_err() {
+                            ticks_dropped += 1;
+                        }
+                        frames_in_sec += 1;
+                        consecutive_errors = 0;
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        log::debug!("[CALL] remote video frame was not decodable: {error}")
+                } else {
+                    undecodable_in_sec += 1;
+                    consecutive_errors += 1;
+                    if state != 0 && last_keyframe_request.elapsed() >= Duration::from_millis(350) {
+                        last_keyframe_request = Instant::now();
+                        let _ = ticks.try_send(VideoTick::NeedsKeyframe);
+                        log::warn!(
+                            "[CALL][REMOTE] missing reference or packet loss (state=0x{state:x}), requested peer keyframe"
+                        );
+                    }
+                    if consecutive_errors >= 30 {
+                        log::warn!("[CALL][REMOTE] 30 consecutive unrenderable frames, resetting decoder instance");
+                        decoder = init_remote_decoder();
+                        consecutive_errors = 0;
                     }
                 }
+
+                if sec_timer.elapsed() >= Duration::from_secs(1) {
+                    let dur = sec_timer.elapsed().as_secs_f32();
+                    let fps = frames_in_sec as f32 / dur;
+                    let count = frames_in_sec.max(1) as f32;
+                    let avg_dec_ms = (decode_us_acc as f32 / count) / 1000.0;
+                    let avg_conv_ms = (conv_us_acc as f32 / count) / 1000.0;
+                    let kbps = (in_bytes_acc as f32 * 8.0 / dur) / 1000.0;
+                    log::info!(
+                        "[CALL][REMOTE] fps={fps:.1} size={}x{} dec={avg_dec_ms:.1}ms rgb={avg_conv_ms:.1}ms rx_rate={kbps:.0}kbps dropped_ticks={ticks_dropped} undecodable={undecodable_in_sec}",
+                        cur_size.0, cur_size.1
+                    );
+                    sec_timer = Instant::now();
+                    frames_in_sec = 0;
+                    decode_us_acc = 0;
+                    conv_us_acc = 0;
+                    undecodable_in_sec = 0;
+                    ticks_dropped = 0;
+                    in_bytes_acc = 0;
+                }
             }
+            log::info!("[CALL][REMOTE] decoder thread ended");
         });
     if let Err(error) = spawned {
-        log::error!("[CALL] remote video decoder could not start: {error}");
+        log::error!("[CALL][REMOTE] remote video decoder could not start: {error}");
     }
 }
 
@@ -1280,6 +1741,20 @@ impl Call {
         self.handle.clone()
     }
 
+    /// Requests that our local camera encoder emit an IDR keyframe (e.g. peer requested it or relay allocated).
+    pub fn request_local_keyframe(&self) {
+        if let Some(pipe) = self.video_pipe.as_ref() {
+            pipe.request_keyframe();
+        }
+    }
+
+    /// Sets a dynamic target bitrate for the local camera encoder.
+    pub fn set_video_target_bitrate(&self, bitrate: u32) {
+        if let Some(pipe) = self.video_pipe.as_ref() {
+            pipe.set_target_bitrate(bitrate);
+        }
+    }
+
     /// The snapshot the UI renders.
     pub fn update(&self) -> CallUpdate {
         CallUpdate {
@@ -1293,7 +1768,15 @@ impl Call {
             camera_on: self
                 .video_pipe
                 .as_ref()
-                .is_some_and(VideoPipeline::camera_running),
+                .is_some_and(VideoPipeline::camera_running)
+                && !self
+                    .video_pipe
+                    .as_ref()
+                    .is_some_and(VideoPipeline::is_screen_sharing),
+            screen_sharing: self
+                .video_pipe
+                .as_ref()
+                .is_some_and(VideoPipeline::is_screen_sharing),
             remote_video: self.remote_video,
             outcome: self.outcome,
             peer_audio: self.peer_audio,
@@ -1979,6 +2462,45 @@ impl Call {
         Ok(self.update())
     }
 
+    /// Toggles desktop screen sharing during an active video call.
+    pub async fn set_screen_share(&mut self, on: bool) -> Result<CallUpdate> {
+        let Some(handle) = self.handle.clone() else {
+            return Err(anyhow!("the call is not up"));
+        };
+        if self.video_pipe.is_none() {
+            return Err(anyhow!("this call has no video"));
+        }
+        self.note_transition(if on {
+            "screen share on requested"
+        } else {
+            "screen share off requested"
+        });
+        if on {
+            let (source, sink) = {
+                let pipe = self.video_pipe.as_mut().expect("checked above");
+                pipe.set_screen_sharing(true)?;
+                (pipe.source(), pipe.sink())
+            };
+            if let Some(speaker) = &self.speaker {
+                speaker.relink();
+            }
+            let _ = handle.resume_video(source, sink).await;
+            self.camera_wanted = true;
+        } else {
+            if let Some(pipe) = self.video_pipe.as_mut() {
+                pipe.set_screen_sharing(false)?;
+            }
+            self.media_stream_changed();
+        }
+        log::info!("[CALL] screen sharing enabled={on}");
+        self.note_transition(if on {
+            "screen share on settled"
+        } else {
+            "screen share off settled"
+        });
+        Ok(self.update())
+    }
+
     /// Asks the peer for video on a call that started as voice, or turns the camera back on when
     /// this is already a video call.
     ///
@@ -2259,17 +2781,23 @@ mod tests {
     fn pipeline_with_a_running_camera() -> VideoPipeline {
         let (ticks, _ticks_rx) = async_channel::bounded::<VideoTick>(2);
         let (remote_tx, _remote_rx) = async_channel::bounded::<VideoFrame>(8);
-        let (_frames, timed) = async_channel::bounded::<TimedVideoFrame>(4);
+        let (timed_tx, timed_rx) = async_channel::bounded::<TimedVideoFrame>(16);
+        let (_empty_tx, empty_rx) = async_channel::bounded::<Vec<u8>>(1);
         VideoPipeline {
             ticks,
             remote_tx,
+            timed_tx,
+            timed_rx,
+            empty_rx,
             camera: Some(CameraCapture {
-                timed,
                 running: Arc::new(AtomicBool::new(true)),
+                force_keyframe: Arc::new(AtomicBool::new(false)),
+                target_bitrate: Arc::new(AtomicU32::new(300_000)),
                 child: Arc::new(std::sync::Mutex::new(None)),
                 thread: None,
             }),
             device: None,
+            is_screen_sharing: false,
         }
     }
 
@@ -2556,6 +3084,7 @@ mod tests {
             started: None,
             muted: false,
             camera_on,
+            screen_sharing: false,
             remote_video: false,
             outcome: None,
             peer_audio: None,

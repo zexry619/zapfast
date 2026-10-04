@@ -9,6 +9,8 @@
 //! starts the timer, and a `<reject>`/`<terminate>`/relay loss ends it with the reason the peer
 //! gave. Nothing is inferred from the button that was pressed.
 
+use std::time::{Duration, Instant};
+
 use super::*;
 use crate::calls::{self, Call, CallUpdate, VideoTick};
 use whatsapp_rust::types::call::IncomingCall;
@@ -28,6 +30,15 @@ pub(super) struct CallRuntime {
     watching: bool,
     /// The snapshot the UI was last handed, so the periodic check publishes only real changes.
     last: CallUpdate,
+    local_ticks: u32,
+    remote_ticks: u32,
+    tick_timer: Instant,
+    cur_video_bitrate: u32,
+    min_video_bitrate: u32,
+    max_video_bitrate: u32,
+    last_bitrate_adjust: Instant,
+    last_probe_up: Instant,
+    last_keyframe_req: Instant,
 }
 
 /// What a call's background tasks report back to the worker loop.
@@ -44,12 +55,22 @@ impl CallRuntime {
     pub(super) fn new(call: Call, frames: Option<async_channel::Receiver<VideoTick>>) -> Self {
         let (_tx, events) = async_channel::bounded(64);
         let last = call.update();
+        let (base_bitrate, min_bitrate, max_bitrate) = (450_000, 280_000, 750_000);
         Self {
             call,
             events,
             frames,
             watching: false,
             last,
+            local_ticks: 0,
+            remote_ticks: 0,
+            tick_timer: Instant::now(),
+            cur_video_bitrate: base_bitrate,
+            min_video_bitrate: min_bitrate,
+            max_video_bitrate: max_bitrate,
+            last_bitrate_adjust: Instant::now(),
+            last_probe_up: Instant::now(),
+            last_keyframe_req: Instant::now() - Duration::from_secs(5),
         }
     }
 
@@ -320,6 +341,20 @@ impl Worker {
         }
     }
 
+    pub(super) async fn set_call_screen_share(&mut self, on: bool) {
+        let outcome = match self.call.as_mut() {
+            Some(runtime) => runtime.call.set_screen_share(on).await,
+            None => return,
+        };
+        match outcome {
+            Ok(update) => self.emit_call(update),
+            Err(error) => {
+                log::error!("[CALL] screen share could not be toggled: {error}");
+                self.emit(Event::Error(error.to_string()));
+            }
+        }
+    }
+
     pub(super) fn set_call_microphone(&mut self, device: Option<String>) {
         // The picker is also the preference: the next call opens where this one was left.
         self.call_defaults.microphone = device.clone();
@@ -371,10 +406,79 @@ impl Worker {
                 CallRuntimeEvent::Media(media) => {
                     if matches!(media, CallEvent::RelayAllocated)
                         && runtime.call.is_video()
-                        && let Some(handle) = runtime.call.handle()
                     {
-                        // A decoder cannot start on a delta frame, so ask for an IDR at once.
-                        handle.request_peer_keyframe(KeyframeUrgency::Immediate);
+                        if let Some(handle) = runtime.call.handle() {
+                            handle.request_peer_keyframe(KeyframeUrgency::Immediate);
+                        }
+                        runtime.call.request_local_keyframe();
+                    }
+                    let mut needs_keyframe = matches!(media, CallEvent::VideoKeyframeNeeded);
+                    if let CallEvent::RtcpReceived { report_blocks, feedback, .. } = &media {
+                        let now = Instant::now();
+                        let max_loss = report_blocks.iter().map(|b| b.fraction_lost).max().unwrap_or(0);
+                        let has_pli = feedback.iter().any(|f| f.packet_type == 206 && matches!(f.fmt, 1 | 4));
+                        if max_loss > 0 {
+                            for block in report_blocks {
+                                if block.fraction_lost > 0 {
+                                    let pct = (block.fraction_lost as f32 / 255.0) * 100.0;
+                                    log::warn!(
+                                        "[CALL][RTCP] peer packet loss: {}/255 ({:.1}%), cum_lost={}, jitter={}, seq={}",
+                                        block.fraction_lost,
+                                        pct,
+                                        block.cumulative_lost,
+                                        block.jitter,
+                                        block.extended_highest_sequence
+                                    );
+                                }
+                            }
+                        }
+                        if has_pli {
+                            needs_keyframe = true;
+                            log::info!("[CALL][RTCP] peer requested keyframe via RTCP PLI/FIR");
+                        }
+                        if max_loss >= 25 {
+                            if runtime.last_bitrate_adjust.elapsed() >= Duration::from_millis(1500) {
+                                runtime.last_bitrate_adjust = now;
+                                runtime.last_probe_up = now;
+                                let new_rate = (runtime.cur_video_bitrate * 85 / 100).max(runtime.min_video_bitrate);
+                                if new_rate < runtime.cur_video_bitrate {
+                                    runtime.cur_video_bitrate = new_rate;
+                                    runtime.call.set_video_target_bitrate(new_rate);
+                                    log::info!(
+                                        "[CALL][BWE] RTCP packet loss ({}/255): backed off target bitrate to {}kbps",
+                                        max_loss,
+                                        new_rate / 1000
+                                    );
+                                }
+                            }
+                        } else if max_loss == 0 && runtime.last_probe_up.elapsed() >= Duration::from_secs(4) {
+                            runtime.last_probe_up = now;
+                            if runtime.cur_video_bitrate < runtime.max_video_bitrate {
+                                let new_rate = (runtime.cur_video_bitrate + 35_000).min(runtime.max_video_bitrate);
+                                runtime.cur_video_bitrate = new_rate;
+                                runtime.call.set_video_target_bitrate(new_rate);
+                                log::info!("[CALL][BWE] connection clean (0 loss): probed target bitrate to {}kbps", new_rate / 1000);
+                            }
+                        }
+                    }
+                    if needs_keyframe {
+                        let now = Instant::now();
+                        if runtime.last_keyframe_req.elapsed() >= Duration::from_millis(350) {
+                            runtime.last_keyframe_req = now;
+                            log::info!("[CALL] peer requested keyframe: forcing local IDR keyframe");
+                            runtime.call.request_local_keyframe();
+                        } else {
+                            log::debug!("[CALL] peer requested keyframe (throttled): skipping duplicate within 350ms");
+                        }
+                    }
+                    if matches!(
+                        media,
+                        CallEvent::PeerVideoStateChanged { .. } | CallEvent::VideoStateChanged { .. }
+                    ) {
+                        if let Some(handle) = runtime.call.handle() {
+                            handle.request_peer_keyframe(KeyframeUrgency::Immediate);
+                        }
+                        runtime.call.request_local_keyframe();
                     }
                     runtime.call.media(&media)
                 }
@@ -388,6 +492,33 @@ impl Worker {
 
     /// One video frame from the current call, straight to the UI.
     pub(super) fn call_frame(&mut self, tick: VideoTick) {
+        if matches!(tick, VideoTick::NeedsKeyframe) {
+            if let Some(runtime) = self.call.as_ref()
+                && let Some(handle) = runtime.call.handle()
+            {
+                handle.request_peer_keyframe(KeyframeUrgency::Immediate);
+            }
+            return;
+        }
+
+        if let Some(runtime) = self.call.as_mut() {
+            match &tick {
+                VideoTick::Local(_) => runtime.local_ticks += 1,
+                VideoTick::Remote(_) => runtime.remote_ticks += 1,
+                VideoTick::NeedsKeyframe => {}
+            }
+            if runtime.tick_timer.elapsed() >= std::time::Duration::from_secs(1) {
+                let dur = runtime.tick_timer.elapsed().as_secs_f32();
+                let remote_fps = runtime.remote_ticks as f32 / dur;
+                let local_fps = runtime.local_ticks as f32 / dur;
+                log::info!(
+                    "[CALL][DISPATCH] to_ui: remote_fps={remote_fps:.1} local_fps={local_fps:.1}"
+                );
+                runtime.tick_timer = std::time::Instant::now();
+                runtime.local_ticks = 0;
+                runtime.remote_ticks = 0;
+            }
+        }
         match tick {
             VideoTick::Local(image) => {
                 self.emit(Event::CallVideo {
@@ -409,6 +540,7 @@ impl Worker {
                     self.emit(Event::Call(Box::new(update)));
                 }
             }
+            VideoTick::NeedsKeyframe => {}
         }
     }
 

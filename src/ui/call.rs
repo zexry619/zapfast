@@ -75,11 +75,17 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         if call.phase == CallPhase::Incoming {
                             ringing(ui, app, &call, &peer, picture.as_deref(), &palette, inner);
                         } else {
-                            live(ui, app, &call, &peer, picture.as_deref(), &palette, inner);
+                            live(ui, app, &call, &peer, picture.as_deref(), &palette, screen, inner);
                         }
                     });
                 });
         });
+
+    if call.phase == CallPhase::Incoming {
+        ringing_controls(ctx, app, &call, &palette);
+    } else {
+        live_controls(ctx, app, &call, &palette);
+    }
 }
 
 /// The backdrop: near-black under a peer's picture, a window colour otherwise.
@@ -101,6 +107,7 @@ fn live(
     peer: &str,
     picture: Option<&Path>,
     palette: &Palette,
+    screen: Rect,
     area: Rect,
 ) {
     // The peer's picture fills the surface when there is one; everything else is drawn on top of
@@ -109,10 +116,11 @@ fn live(
     if call.video
         && let Some(image) = app.call_remote_frame.clone()
     {
-        let at = fit_inside(area, vec2(image.width() as f32, image.height() as f32));
+        let at = fit_inside(screen, vec2(image.width() as f32, image.height() as f32));
         let texture = call_texture(
-            ui,
+            ui.ctx(),
             &mut app.call_remote_texture,
+            &mut app.call_remote_uploaded,
             "zapfast-call-remote",
             &image,
         );
@@ -143,8 +151,9 @@ fn live(
         ui.painter()
             .rect_filled(at.expand(3.0), CornerRadius::same(12), palette.outline);
         let texture = call_texture(
-            ui,
+            ui.ctx(),
             &mut app.call_local_texture,
+            &mut app.call_local_uploaded,
             "zapfast-call-local",
             &image,
         );
@@ -236,23 +245,6 @@ fn live(
             app.actions.push(Action::ToggleCallFullscreen);
         }
     });
-
-    ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-        ui.add_space(24.0);
-        egui::Frame::new()
-            .fill(Color32::from_black_alpha(210))
-            .corner_radius(CornerRadius::same((CONTROL / 2.0 + 8.0) as u8))
-            .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(35)))
-            .inner_margin(egui::Margin::symmetric(20, 10))
-            .show(ui, |ui| {
-                controls(ui, app, call, palette);
-            });
-
-        if app.call_devices_open {
-            ui.add_space(14.0);
-            devices(ui, app, call);
-        }
-    });
 }
 
 /// The bar that keeps a call the reader stepped away from in view.
@@ -322,22 +314,42 @@ fn bar(app: &mut App, ctx: &egui::Context, call: &CallUpdate, peer: &str, palett
 /// A video call repaints once per frame, so allocating a fresh texture each time churns GPU memory
 /// and re-uploads the whole picture. `TextureHandle::set` resizes and refills the one already there.
 fn call_texture(
-    ui: &egui::Ui,
+    ctx: &egui::Context,
     kept: &mut Option<egui::TextureHandle>,
+    uploaded: &mut Option<std::sync::Arc<egui::ColorImage>>,
     name: &str,
-    image: &egui::ColorImage,
+    image: &std::sync::Arc<egui::ColorImage>,
 ) -> egui::TextureId {
+    let t_start = std::time::Instant::now();
     match kept {
         Some(texture) => {
-            texture.set(image.clone(), TextureOptions::LINEAR);
+            let changed = match uploaded {
+                Some(prev) => !std::sync::Arc::ptr_eq(prev, image),
+                None => true,
+            };
+            if changed {
+                texture.set(
+                    egui::ImageData::Color(std::sync::Arc::clone(image)),
+                    TextureOptions::LINEAR,
+                );
+                *uploaded = Some(std::sync::Arc::clone(image));
+                let dur = t_start.elapsed();
+                if dur.as_millis() > 10 {
+                    log::warn!("[CALL][UI] slow GPU texture update for {name}: took {}ms", dur.as_millis());
+                }
+            }
             texture.id()
         }
         None => {
-            let texture = ui
-                .ctx()
-                .load_texture(name, image.clone(), TextureOptions::LINEAR);
+            let texture = ctx.load_texture(
+                name,
+                egui::ImageData::Color(std::sync::Arc::clone(image)),
+                TextureOptions::LINEAR,
+            );
             let id = texture.id();
             *kept = Some(texture);
+            *uploaded = Some(std::sync::Arc::clone(image));
+            log::info!("[CALL][UI] loaded new GPU texture for {name}: size={:?}", image.size);
             id
         }
     }
@@ -528,24 +540,28 @@ fn controls(ui: &mut egui::Ui, app: &mut App, call: &CallUpdate, palette: &Palet
     // speaker/devices, hang up), four on a voice call where screen share is not drawn, and three
     // where there is no video capability to press.
     let video = crate::calls::capabilities().video;
-    let buttons = if !video {
-        3.0
+    let button_count: usize = if !video {
+        3
     } else if call.video {
-        5.0
+        5
     } else {
-        4.0
+        4
     };
-    ui.horizontal(|ui| {
-        let spacing = 14.0;
-        let width = buttons * CONTROL + (buttons - 1.0) * spacing;
-        ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+    let spacing = 14.0;
+    let width = button_count as f32 * CONTROL + (button_count - 1) as f32 * spacing;
 
-        // Microphone: the engine's own mute flag, which is what stops outgoing audio.
-        let tip = if call.muted {
-            gettext(locale, "Unmute").into_owned()
-        } else {
-            gettext(locale, "Mute").into_owned()
-        };
+    ui.allocate_ui_with_layout(
+        vec2(width, CONTROL),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = spacing;
+
+            // Microphone: the engine's own mute flag, which is what stops outgoing audio.
+            let tip = if call.muted {
+                gettext(locale, "Unmute").into_owned()
+            } else {
+                gettext(locale, "Mute").into_owned()
+            };
         let response = control(
             ui,
             if call.muted {
@@ -600,32 +616,35 @@ fn controls(ui: &mut egui::Ui, app: &mut App, call: &CallUpdate, palette: &Palet
             }
         }
 
-        // Screen sharing has no 1:1 path in the protocol crate. The button is driven by the
-        // capability flag rather than by a literal `false`, so the day the crate grows the path this
-        // becomes a live control and nothing else here changes.
+        // Screen sharing: captures desktop screen and transmits over the video RTP plane.
         if call.video {
             let supported = crate::calls::screen_share_supported();
-            let tip = if supported {
-                gettext(locale, "Share your screen").into_owned()
+            let tip = if call.screen_sharing {
+                gettext(locale, "Stop sharing screen").into_owned()
             } else {
-                // Stated plainly rather than hinted at: the pinned whatsapp-rust revision has no
-                // 1:1 screen-share path, and pointing at a virtual camera instead is an honest
-                // workaround rather than a screen-share implementation.
-                gettext(
-                    locale,
-                    "1:1 screen sharing is not available in the whatsapp-rust revision this app uses; an OBS virtual camera can be selected as a camera instead",
-                )
-                .into_owned()
+                gettext(locale, "Share your screen").into_owned()
             };
-            control(
+            let response = control(
                 ui,
                 Icon::Monitor,
                 CONTROL,
-                palette.surface_active,
-                palette.text,
+                if call.screen_sharing {
+                    palette.accent
+                } else {
+                    palette.surface_active
+                },
+                if call.screen_sharing {
+                    palette.on_accent
+                } else {
+                    palette.text
+                },
                 &tip,
-                supported,
+                supported && connected,
             );
+            if response.clicked() {
+                app.actions
+                    .push(Action::SetCallScreenShare(!call.screen_sharing));
+            }
         }
 
         // The speaker button shows and hides the device pickers below it.
@@ -741,73 +760,92 @@ fn devices(ui: &mut egui::Ui, app: &mut App, call: &CallUpdate) {
         .iter()
         .map(|device| (device.id.clone(), device.label.clone()))
         .collect();
-    let connected = call.phase.is_connected();
+    let live = call.phase.is_live();
+
+    let picker_count = if call.video { 3.0 } else { 2.0 };
+    let picker_width = 180.0;
+    let spacing = 16.0;
+    let content_width = picker_count * picker_width + (picker_count - 1.0) * spacing;
 
     egui::Frame::new()
         .fill(Color32::from_rgba_premultiplied(24, 28, 34, 245))
         .corner_radius(CornerRadius::same(18))
         .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(45)))
         .inner_margin(egui::Margin::symmetric(22, 16))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 20,
+            spread: 0,
+            color: Color32::from_black_alpha(100),
+        })
         .show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    theme::text(
-                        ui,
-                        gettext(locale, "Audio & Video Devices").into_owned(),
-                        theme::bold(13.5),
-                        Color32::WHITE,
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let close_btn = ui.add(
-                            egui::Button::new(
-                                egui::RichText::new("✕").size(14.0).color(Color32::from_white_alpha(190))
-                            ).fill(Color32::TRANSPARENT).frame(false)
+            ui.allocate_ui_with_layout(
+                vec2(content_width, 0.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        theme::text(
+                            ui,
+                            gettext(locale, "Audio & Video Devices").into_owned(),
+                            theme::bold(13.5),
+                            Color32::WHITE,
                         );
-                        if close_btn.clicked() {
-                            app.call_devices_open = false;
-                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let close_btn = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new("✕")
+                                        .size(14.0)
+                                        .color(Color32::from_white_alpha(190)),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .frame(false),
+                            );
+                            if close_btn.clicked() {
+                                app.call_devices_open = false;
+                            }
+                        });
                     });
-                });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let mut actions = Vec::new();
-                    let choices = Picker {
-                        salt: "call-microphone",
-                        icon: Icon::Mic,
-                        title: &gettext(locale, "Microphone"),
-                        default_label: &default_label,
-                        current: call.microphone.as_deref(),
-                        devices: &microphones,
-                        enabled: connected,
-                    };
-                    choices.show(ui, &mut actions, Action::SetCallMicrophone);
-                    ui.add_space(16.0);
-                    let choices = Picker {
-                        salt: "call-speaker",
-                        icon: Icon::Volume2,
-                        title: &gettext(locale, "Speaker"),
-                        default_label: &default_label,
-                        current: call.speaker.as_deref(),
-                        devices: &speakers,
-                        enabled: connected,
-                    };
-                    choices.show(ui, &mut actions, Action::SetCallSpeaker);
-                    if call.video {
-                        ui.add_space(16.0);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let mut actions = Vec::new();
                         let choices = Picker {
-                            salt: "call-camera",
-                            icon: Icon::Video,
-                            title: &gettext(locale, "Camera"),
+                            salt: "call-microphone",
+                            icon: Icon::Mic,
+                            title: &gettext(locale, "Microphone"),
                             default_label: &default_label,
-                            current: call.camera.as_deref(),
-                            devices: &cameras,
-                            enabled: connected,
+                            current: call.microphone.as_deref(),
+                            devices: &microphones,
+                            enabled: live,
                         };
-                        choices.show(ui, &mut actions, Action::SetCallCameraDevice);
-                    }
-                    app.actions.extend(actions);
-                });
-            });
+                        choices.show(ui, &mut actions, Action::SetCallMicrophone);
+                        ui.add_space(spacing);
+                        let choices = Picker {
+                            salt: "call-speaker",
+                            icon: Icon::Volume2,
+                            title: &gettext(locale, "Speaker"),
+                            default_label: &default_label,
+                            current: call.speaker.as_deref(),
+                            devices: &speakers,
+                            enabled: live,
+                        };
+                        choices.show(ui, &mut actions, Action::SetCallSpeaker);
+                        if call.video {
+                            ui.add_space(spacing);
+                            let choices = Picker {
+                                salt: "call-camera",
+                                icon: Icon::Video,
+                                title: &gettext(locale, "Camera"),
+                                default_label: &default_label,
+                                current: call.camera.as_deref(),
+                                devices: &cameras,
+                                enabled: live,
+                            };
+                            choices.show(ui, &mut actions, Action::SetCallCameraDevice);
+                        }
+                        app.actions.extend(actions);
+                    });
+                },
+            );
         });
 }
 
@@ -872,7 +910,6 @@ impl Picker<'_> {
                     });
             });
         });
-        ui.add_space(12.0);
     }
 }
 
@@ -912,40 +949,77 @@ fn ringing(
             palette.secondary,
         );
     });
-    ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            let width = 2.0 * CONTROL + 60.0;
-            ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
-            let accept = gettext(locale, "Accept").into_owned();
-            let response = control(
-                ui,
-                Icon::Phone,
-                CONTROL,
-                palette.accent,
-                palette.on_accent,
-                &accept,
-                true,
-            );
-            if response.clicked() {
-                app.actions.push(Action::AnswerCall);
-            }
-            ui.add_space(60.0);
-            let decline = gettext(locale, "Decline").into_owned();
-            let response = control(
-                ui,
-                Icon::Phone,
-                CONTROL,
-                palette.danger,
-                Color32::WHITE,
-                &decline,
-                true,
-            );
-            if response.clicked() {
-                app.actions.push(Action::DeclineCall);
-            }
+}
+
+fn live_controls(ctx: &egui::Context, app: &mut App, call: &CallUpdate, palette: &Palette) {
+    egui::Area::new(egui::Id::new("zapfast-call-live-controls"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -28.0))
+        .show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                if app.call_devices_open {
+                    devices(ui, app, call);
+                    ui.add_space(14.0);
+                }
+                egui::Frame::new()
+                    .fill(Color32::from_black_alpha(225))
+                    .corner_radius(CornerRadius::same((CONTROL / 2.0 + 8.0) as u8))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(35)))
+                    .inner_margin(egui::Margin::symmetric(20, 10))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 4],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(90),
+                    })
+                    .show(ui, |ui| {
+                        controls(ui, app, call, palette);
+                    });
+            });
         });
-    });
+}
+
+fn ringing_controls(ctx: &egui::Context, app: &mut App, _call: &CallUpdate, palette: &Palette) {
+    let locale = app.locale;
+    egui::Area::new(egui::Id::new("zapfast-call-ringing-controls"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -36.0))
+        .show(ctx, |ui| {
+            let width = 2.0 * CONTROL + 60.0;
+            ui.allocate_ui_with_layout(
+                vec2(width, CONTROL),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 60.0;
+                    let accept = gettext(locale, "Accept").into_owned();
+                    let response = control(
+                        ui,
+                        Icon::Phone,
+                        CONTROL,
+                        palette.accent,
+                        palette.on_accent,
+                        &accept,
+                        true,
+                    );
+                    if response.clicked() {
+                        app.actions.push(Action::AnswerCall);
+                    }
+                    let decline = gettext(locale, "Decline").into_owned();
+                    let response = control(
+                        ui,
+                        Icon::Phone,
+                        CONTROL,
+                        palette.danger,
+                        Color32::WHITE,
+                        &decline,
+                        true,
+                    );
+                    if response.clicked() {
+                        app.actions.push(Action::DeclineCall);
+                    }
+                },
+            );
+        });
 }
 
 /// The largest rect of `size`'s aspect ratio that fits inside `area`.

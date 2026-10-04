@@ -106,6 +106,7 @@ resvg = { version = "0.45", default-features = false }
 # Desktop notifications through D-Bus on Linux and system frameworks elsewhere.
 notify-rust = { version = "4", default-features = false, features = ["z"] }
 openh264 = "0.9"
+openh264-sys2 = "0.9"
 mp4 = "0.14"
 # The 0.22 release ends the sound of an interleaved MP4 at the first packet of
 # another track, so a video that has a picture and a sound track plays a tenth

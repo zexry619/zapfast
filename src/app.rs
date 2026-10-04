@@ -686,6 +686,8 @@ pub struct App {
     /// churns GPU memory and uploads at the call's own rate.
     pub call_local_texture: Option<egui::TextureHandle>,
     pub call_remote_texture: Option<egui::TextureHandle>,
+    pub call_local_uploaded: Option<std::sync::Arc<egui::ColorImage>>,
+    pub call_remote_uploaded: Option<std::sync::Arc<egui::ColorImage>>,
     /// Set when a call event or a video frame arrived, so the frame is drawn now instead of when
     /// something else happens to ask for a repaint.
     call_repaint: bool,
@@ -916,6 +918,7 @@ impl App {
             speaker: app.settings.call_speaker.clone(),
             camera: app.settings.call_camera.clone(),
         });
+        app.backend.send(Command::RefreshCallDevices);
         if crate::autostart::supported() {
             app.start_with_system = Some(crate::autostart::enabled());
         }
@@ -1163,6 +1166,8 @@ impl App {
             call_remote_frame: None,
             call_local_texture: None,
             call_remote_texture: None,
+            call_local_uploaded: None,
+            call_remote_uploaded: None,
             call_repaint: false,
             start_with_system: None,
             waker,
@@ -1815,6 +1820,10 @@ impl App {
             self.call_surface_hidden = true;
             self.call_local_frame = None;
             self.call_remote_frame = None;
+            self.call_local_uploaded = None;
+            self.call_remote_uploaded = None;
+            self.call_local_texture = None;
+            self.call_remote_texture = None;
         }
     }
 
@@ -3638,6 +3647,10 @@ impl App {
             }
             self.call_local_frame = None;
             self.call_remote_frame = None;
+            self.call_local_uploaded = None;
+            self.call_remote_uploaded = None;
+            self.call_local_texture = None;
+            self.call_remote_texture = None;
             self.call_surface_until = Some(Instant::now() + CALL_FAREWELL);
             // How a call ended is the whole reason the surface lingers, but a locked chat still says
             // nothing: with the folder closed the four-second farewell stays behind the bar instead
@@ -3723,6 +3736,10 @@ impl App {
             self.call = None;
             self.call_local_frame = None;
             self.call_remote_frame = None;
+            self.call_local_uploaded = None;
+            self.call_remote_uploaded = None;
+            self.call_local_texture = None;
+            self.call_remote_texture = None;
         }
         // Full screen belongs to the call surface and only while the reader is looking at it.
         // Whichever way the surface was put aside (the back button, Escape, a locked chat, or a
@@ -3735,7 +3752,11 @@ impl App {
             // The duration changes every second, and a video call repaints from its frames; asking
             // here keeps a muted, idle voice call's timer honest either way.
             if call.phase.is_live() {
-                ctx.request_repaint_after(Duration::from_millis(500));
+                if call.video {
+                    ctx.request_repaint_after(Duration::from_millis(33));
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(500));
+                }
             }
         }
         if self.call_repaint {
@@ -3953,8 +3974,11 @@ impl App {
                 let opens_chats = page == Page::Chats;
                 // Privacy can change on the phone at any time, and nothing
                 // announces it: read it again whenever Settings opens.
-                if page == Page::Settings && self.page != Page::Settings && self.is_connected() {
-                    self.backend.send(Command::FetchAccountPrivacy);
+                if page == Page::Settings && self.page != Page::Settings {
+                    if self.is_connected() {
+                        self.backend.send(Command::FetchAccountPrivacy);
+                    }
+                    self.backend.send(Command::RefreshCallDevices);
                 }
                 // Typed passwords do not wait in a form nobody sees.
                 if page != Page::Settings && !self.app_lock.checking() {
@@ -4088,6 +4112,12 @@ impl App {
                 self.settings.call_camera = device.clone();
                 self.mark_settings_dirty();
                 self.backend.send(Command::SetCallCameraDevice(device));
+            }
+            Action::SetCallScreenShare(on) => {
+                self.backend.send(Command::SetCallScreenShare(on));
+            }
+            Action::RefreshCallDevices => {
+                self.backend.send(Command::RefreshCallDevices);
             }
             Action::CloseChat => {
                 if let Some(chat) = self.open_chat.take() {
@@ -5504,10 +5534,12 @@ impl App {
             }
             Action::OpenStoryViewer { sender, index } => {
                 self.video.stop();
+                self.video.set_expanded(true);
                 self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(sender, index));
             }
             Action::CloseStoryViewer => {
                 self.video.stop();
+                self.video.set_expanded(false);
                 self.story_viewer = None;
             }
             Action::NextStory => {
@@ -5516,6 +5548,7 @@ impl App {
                     if let Some((next_sender, next_index)) = self.stories.next_item(&viewer.sender, viewer.index) {
                         self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(next_sender, next_index));
                     } else {
+                        self.video.set_expanded(false);
                         self.story_viewer = None;
                     }
                 }
@@ -5526,6 +5559,7 @@ impl App {
                     if let Some((prev_sender, prev_index)) = self.stories.prev_item(&viewer.sender, viewer.index) {
                         self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(prev_sender, prev_index));
                     } else {
+                        self.video.set_expanded(false);
                         self.story_viewer = None;
                     }
                 }
@@ -5561,6 +5595,7 @@ impl App {
                     caption: None,
                     thumbnail: None,
                     media_path: None,
+                    raw_message: None,
                     viewed: true,
                 });
                 let stories_file = self.dirs.state.join("stories.json");
@@ -5598,6 +5633,7 @@ impl App {
                     caption: caption.clone(),
                     thumbnail: None,
                     media_path: Some(path.to_string_lossy().to_string()),
+                    raw_message: None,
                     viewed: true,
                 });
                 let stories_file = self.dirs.state.join("stories.json");
@@ -5608,6 +5644,19 @@ impl App {
                 } else if let Ok(bytes) = std::fs::read(&path) {
                     self.backend.send(Command::PostImageStory { bytes, caption });
                 }
+            }
+            Action::ReplyStory {
+                sender,
+                story_id,
+                text,
+                raw_message,
+            } => {
+                self.backend.send(Command::ReplyStory {
+                    sender,
+                    story_id,
+                    text,
+                    raw_message,
+                });
             }
             // Route through the configured window-close behavior.
             Action::CloseWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -5924,7 +5973,7 @@ impl App {
     /// Shows the playing video's frames, stops it once its chat is left, and
     /// hands a video it cannot decode to the system player.
     fn tick_video(&mut self, ctx: &egui::Context) {
-        if self.video.message().is_some() && self.video_chat != self.open_chat {
+        if self.story_viewer.is_none() && self.video.message().is_some() && self.video_chat != self.open_chat {
             self.video.stop();
         }
         if self.video_expanded && self.video.message().is_none() {
@@ -11361,6 +11410,7 @@ mod tests {
             started: None,
             muted: false,
             camera_on: false,
+            screen_sharing: false,
             remote_video: false,
             outcome: None,
             peer_audio: None,

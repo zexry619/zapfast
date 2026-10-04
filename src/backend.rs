@@ -335,6 +335,8 @@ pub enum Command {
     SetCallSpeaker(Option<String>),
     /// Switches the current call's camera node.
     SetCallCameraDevice(Option<String>),
+    /// Toggles screen sharing in the active video call.
+    SetCallScreenShare(bool),
     /// Lists the microphones, speakers and cameras the call screen offers.
     RefreshCallDevices,
     /// The devices a call should open with: the ones last picked, as the settings hold them.
@@ -755,6 +757,18 @@ pub enum Command {
     ViewStory {
         sender: String,
         id: String,
+    },
+    /// Download story media from its raw protobuf message.
+    DownloadStoryMedia {
+        id: String,
+        raw_message: Vec<u8>,
+    },
+    /// Reply to a status / story with a quoted message.
+    ReplyStory {
+        sender: String,
+        story_id: String,
+        text: String,
+        raw_message: Option<Vec<u8>>,
     },
 }
 

@@ -433,6 +433,137 @@ fn sections(app: &App) -> Vec<Section> {
         },
     );
 
+    let mut calls = Section::new(translated(locale, "Voice & Video"));
+
+    let mic_label = app
+        .settings
+        .call_microphone
+        .as_deref()
+        .and_then(|id| {
+            app.call_devices
+                .microphones
+                .iter()
+                .find(|d| d.id == id)
+                .map(|d| d.label.clone())
+        })
+        .unwrap_or_else(|| crate::i18n::gettext(locale, "Default device").into_owned());
+
+    calls.row(
+        translated(locale, "Microphone"),
+        translated(locale, "Microphone used for voice and video calls."),
+        move |ui, app| {
+            let default_text = crate::i18n::gettext(app.locale, "Default device");
+            let response = egui::ComboBox::from_id_salt("settings_call_mic")
+                .selected_text(&mic_label)
+                .width(240.0_f32.min(ui.available_width()))
+                .show_ui(ui, |ui| {
+                    let is_default = app.settings.call_microphone.is_none();
+                    if theme_option(ui, &palette, &default_text, is_default) {
+                        app.actions.push(Action::SetCallMicrophone(None));
+                    }
+                    for mic in &app.call_devices.microphones {
+                        let selected = app.settings.call_microphone.as_deref() == Some(&mic.id);
+                        if theme_option(ui, &palette, &mic.label, selected) {
+                            app.actions.push(Action::SetCallMicrophone(Some(mic.id.clone())));
+                        }
+                    }
+                });
+            theme::reveal_focus(&response.response);
+        },
+    );
+
+    let speaker_label = app
+        .settings
+        .call_speaker
+        .as_deref()
+        .and_then(|id| {
+            app.call_devices
+                .speakers
+                .iter()
+                .find(|d| d.id == id)
+                .map(|d| d.label.clone())
+        })
+        .unwrap_or_else(|| crate::i18n::gettext(locale, "Default device").into_owned());
+
+    calls.row(
+        translated(locale, "Speaker"),
+        translated(locale, "Speaker or output device used for calls."),
+        move |ui, app| {
+            let default_text = crate::i18n::gettext(app.locale, "Default device");
+            let response = egui::ComboBox::from_id_salt("settings_call_speaker")
+                .selected_text(&speaker_label)
+                .width(240.0_f32.min(ui.available_width()))
+                .show_ui(ui, |ui| {
+                    let is_default = app.settings.call_speaker.is_none();
+                    if theme_option(ui, &palette, &default_text, is_default) {
+                        app.actions.push(Action::SetCallSpeaker(None));
+                    }
+                    for speaker in &app.call_devices.speakers {
+                        let selected = app.settings.call_speaker.as_deref() == Some(&speaker.id);
+                        if theme_option(ui, &palette, &speaker.label, selected) {
+                            app.actions.push(Action::SetCallSpeaker(Some(speaker.id.clone())));
+                        }
+                    }
+                });
+            theme::reveal_focus(&response.response);
+        },
+    );
+
+    let camera_label = app
+        .settings
+        .call_camera
+        .as_deref()
+        .and_then(|id| {
+            app.call_devices
+                .cameras
+                .iter()
+                .find(|d| d.id == id)
+                .map(|d| d.label.clone())
+        })
+        .unwrap_or_else(|| crate::i18n::gettext(locale, "Default device").into_owned());
+
+    calls.row(
+        translated(locale, "Camera"),
+        translated(locale, "Camera device used for video calls."),
+        move |ui, app| {
+            let default_text = crate::i18n::gettext(app.locale, "Default device");
+            let response = egui::ComboBox::from_id_salt("settings_call_camera")
+                .selected_text(&camera_label)
+                .width(240.0_f32.min(ui.available_width()))
+                .show_ui(ui, |ui| {
+                    let is_default = app.settings.call_camera.is_none();
+                    if theme_option(ui, &palette, &default_text, is_default) {
+                        app.actions.push(Action::SetCallCameraDevice(None));
+                    }
+                    for camera in &app.call_devices.cameras {
+                        let selected = app.settings.call_camera.as_deref() == Some(&camera.id);
+                        if theme_option(ui, &palette, &camera.label, selected) {
+                            app.actions.push(Action::SetCallCameraDevice(Some(camera.id.clone())));
+                        }
+                    }
+                });
+            theme::reveal_focus(&response.response);
+        },
+    );
+
+    calls.row(
+        translated(locale, "Device detection"),
+        translated(locale, "Scan for newly connected cameras, microphones, or headsets."),
+        move |ui, app| {
+            if theme::soft_button(
+                ui,
+                &palette,
+                Some(Icon::Refresh),
+                &crate::i18n::gettext(app.locale, "Refresh devices"),
+                false,
+            )
+            .clicked()
+            {
+                app.actions.push(Action::RefreshCallDevices);
+            }
+        },
+    );
+
     let mut notifications = Section::new(translated(locale, "Notifications"));
     notifications.toggle(
         translated(locale, "Desktop notifications"),
@@ -742,6 +873,7 @@ fn sections(app: &App) -> Vec<Section> {
     vec![
         appearance,
         chats,
+        calls,
         notifications,
         privacy,
         system,

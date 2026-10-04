@@ -1050,34 +1050,77 @@ struct Planes<'a> {
 fn convert(planes: &Planes<'_>, out: (usize, usize), turns: u8) -> ColorImage {
     let (width, height) = planes.size;
     let (out_width, out_height) = out;
-    let turned = if turns % 2 == 1 {
+    let turn_mode = turns % 4;
+    let turned = if turn_mode % 2 == 1 {
         [out_height, out_width]
     } else {
         [out_width, out_height]
     };
-    let scaling = out != planes.size;
+
+    // Fast-path 1: Direct 1:1 conversion without rotation (common in video calls)
+    if out == planes.size && turn_mode == 0 {
+        let mut pixels = vec![egui::Color32::BLACK; width * height];
+        for oy in 0..height {
+            let row_offset = oy * width;
+            let luma = &planes.y[oy * planes.strides.0..];
+            let u = &planes.u[(oy / 2) * planes.strides.1..];
+            let v = &planes.v[(oy / 2) * planes.strides.2..];
+            for ox in 0..width {
+                pixels[row_offset + ox] =
+                    rgb(luma[ox] as i32, u[ox / 2] as i32, v[ox / 2] as i32);
+            }
+        }
+        return ColorImage::new(turned, pixels);
+    }
+
+    // Fast-path 2: Direct 1:1 conversion with rotation (no scaling divisions or luma averaging)
+    if out == planes.size {
+        let mut pixels = vec![egui::Color32::BLACK; out_width * out_height];
+        for oy in 0..height {
+            let luma = &planes.y[oy * planes.strides.0..];
+            let u = &planes.u[(oy / 2) * planes.strides.1..];
+            let v = &planes.v[(oy / 2) * planes.strides.2..];
+            for ox in 0..width {
+                let (tx, ty) = match turn_mode {
+                    1 => (out_height - 1 - oy, ox),
+                    2 => (out_width - 1 - ox, out_height - 1 - oy),
+                    3 => (oy, out_width - 1 - ox),
+                    _ => (ox, oy),
+                };
+                pixels[ty * turned[0] + tx] =
+                    rgb(luma[ox] as i32, u[ox / 2] as i32, v[ox / 2] as i32);
+            }
+        }
+        return ColorImage::new(turned, pixels);
+    }
+
+    // Scaled path: Precalculate sx and right coordinates in lookup tables to avoid per-pixel divisions
+    let sx_table: Vec<usize> = (0..out_width)
+        .map(|ox| (ox * width / out_width).min(width - 1))
+        .collect();
+    let right_table: Vec<usize> = sx_table
+        .iter()
+        .map(|&sx| (sx + 1).min(width - 1))
+        .collect();
+
     let mut pixels = vec![egui::Color32::BLACK; out_width * out_height];
     for oy in 0..out_height {
         let sy = (oy * height / out_height).min(height - 1);
-        let below = if scaling {
-            (sy + 1).min(height - 1)
-        } else {
-            sy
-        };
+        let below = (sy + 1).min(height - 1);
         let luma = &planes.y[sy * planes.strides.0..];
         let luma_below = &planes.y[below * planes.strides.0..];
-        let u = &planes.u[sy / 2 * planes.strides.1..];
-        let v = &planes.v[sy / 2 * planes.strides.2..];
+        let u = &planes.u[(sy / 2) * planes.strides.1..];
+        let v = &planes.v[(sy / 2) * planes.strides.2..];
         for ox in 0..out_width {
-            let sx = (ox * width / out_width).min(width - 1);
-            let right = if scaling { (sx + 1).min(width - 1) } else { sx };
+            let sx = sx_table[ox];
+            let right = right_table[ox];
             let y = (u32::from(luma[sx])
                 + u32::from(luma[right])
                 + u32::from(luma_below[sx])
                 + u32::from(luma_below[right])
                 + 2)
                 / 4;
-            let (tx, ty) = match turns {
+            let (tx, ty) = match turn_mode {
                 1 => (out_height - 1 - oy, ox),
                 2 => (out_width - 1 - ox, out_height - 1 - oy),
                 3 => (oy, out_width - 1 - ox),
@@ -1090,6 +1133,7 @@ fn convert(planes: &Planes<'_>, out: (usize, usize), turns: u8) -> ColorImage {
 }
 
 /// One limited-range BT.601 pixel in RGB.
+#[inline(always)]
 fn rgb(y: i32, u: i32, v: i32) -> egui::Color32 {
     let (c, d, e) = (298 * (y - 16), u - 128, v - 128);
     let channel = |value: i32| ((value + 128) >> 8).clamp(0, 255) as u8;
