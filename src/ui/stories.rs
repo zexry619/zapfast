@@ -906,6 +906,24 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
                     app.actions.push(Action::CloseStoryViewer);
                 }
 
+                // Delete button for own story updates (Revoke)
+                if is_my_story {
+                    let delete_rect = close_rect.translate(vec2(-36.0, 0.0));
+                    let del_resp = ui.allocate_rect(delete_rect, Sense::click());
+                    if del_resp.hovered() {
+                        ui.painter().circle_filled(
+                            delete_rect.center(),
+                            14.0,
+                            Color32::from_rgb(220, 50, 50),
+                        );
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    theme::paint_icon(ui, Icon::Trash, delete_rect, 15.0, Color32::WHITE);
+                    if del_resp.clicked() {
+                        app.actions.push(Action::RevokeStory(current_item.id.clone()));
+                    }
+                }
+
                 // Persistent Pause indicator in center of card (when not held)
                 if state.paused && !is_media_loading {
                     let pause_center = card_rect.center();

@@ -273,6 +273,7 @@ fn message(chat: &str, id: &str, from_me: bool, timestamp: i64, content: Content
         mentions: Vec::new(),
         forwarded: false,
         thumbnail: None,
+        starred: false,
     }
 }
 

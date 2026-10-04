@@ -783,6 +783,42 @@ pub enum Command {
         text: String,
         raw_message: Option<Vec<u8>>,
     },
+    /// Toggles or sets starred status of a message.
+    ToggleStarMessage {
+        chat: ChatId,
+        id: String,
+        starred: bool,
+    },
+    /// Fetches starred messages, optionally filtered by chat.
+    FetchStarredMessages {
+        chat: Option<ChatId>,
+    },
+    /// Pins a message in a chat with duration in seconds (86400, 604800, 2592000).
+    PinMessage {
+        chat: ChatId,
+        id: String,
+        duration_secs: u32,
+    },
+    /// Unpins a message in a chat.
+    UnpinMessage {
+        chat: ChatId,
+        id: String,
+    },
+    /// Revokes an owned story/status by id.
+    RevokeStory(String),
+    /// Blocks a contact JID.
+    BlockContact(String),
+    /// Unblocks a contact JID.
+    UnblockContact(String),
+    /// Fetches current blocklist.
+    FetchBlocklist,
+    /// Sets disappearing messages timer in seconds (0 = off, 86400, 604800, 7776000).
+    SetChatEphemeral {
+        chat: ChatId,
+        duration_secs: u32,
+    },
+    /// Fetches recent call logs.
+    FetchCallLogs,
 }
 
 #[derive(Debug)]
@@ -1024,6 +1060,38 @@ pub enum Event {
     StoryMediaDownloaded {
         id: String,
         path: String,
+    },
+    /// Starred messages list.
+    StarredMessages {
+        chat: Option<ChatId>,
+        messages: Vec<Message>,
+    },
+    /// A single message had its starred status updated.
+    MessageStarred {
+        chat: ChatId,
+        id: String,
+        starred: bool,
+    },
+    /// A chat's pinned message was updated or cleared.
+    MessagePinned {
+        chat: ChatId,
+        pinned: Option<crate::model::PinnedMessage>,
+    },
+    /// An owned story was revoked.
+    StoryRevoked(String),
+    /// Current blocklist of contact JIDs.
+    Blocklist(Vec<String>),
+    /// A contact was blocked or unblocked.
+    ContactBlocked {
+        jid: String,
+        blocked: bool,
+    },
+    /// Recent call logs list.
+    CallLogs(Vec<crate::model::CallLogEntry>),
+    /// Chat ephemeral timer was updated.
+    ChatEphemeralUpdated {
+        chat: ChatId,
+        duration_secs: Option<u32>,
     },
 }
 

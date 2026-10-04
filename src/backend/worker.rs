@@ -54,8 +54,9 @@ use super::{Command, Event, GroupEdit, LinkStatus, Refusal, Unsent, Waker, read_
 use crate::app::PAGE;
 use crate::archive::Archive;
 use crate::model::{
-    ATTACHMENT_DOWNLOAD_LIMIT, Chat, ChatId, ChatKind, Contact, Content, Delivery, Gif, GifError,
-    LIVE_LOCATION_LIMIT, LinkPreview, Media, MentionRef, Message, Quoted, Reaction,
+    ATTACHMENT_DOWNLOAD_LIMIT, CallLogEntry, CallLogStatus, Chat, ChatId, ChatKind, Contact,
+    Content, Delivery, Gif, GifError, LIVE_LOCATION_LIMIT, LinkPreview, Media, MentionRef,
+    Message, PinnedMessage, Quoted, Reaction,
 };
 use crate::paths::AccountDirs;
 use crate::privacy::{self, PrivacyChoice, PrivacyKind};
@@ -2638,6 +2639,48 @@ impl Worker {
                 let _ = self.archive.set_meta("me_name", &update.new_name);
                 self.emit(self.me_event());
             }
+            E::StarUpdate(update) => {
+                let chat = self.canonical(&update.chat_jid);
+                let starred = update.action.starred.unwrap_or(false);
+                let _ = self.archive.set_starred(&chat, &update.message_id, starred);
+                self.emit(Event::MessageStarred {
+                    chat: chat.clone(),
+                    id: update.message_id.clone(),
+                    starred,
+                });
+            }
+            E::CallLogSync(sync) => {
+                let peer = if sync.from_me {
+                    sync.record
+                        .participants
+                        .first()
+                        .and_then(|p| p.user_jid.clone())
+                        .unwrap_or_else(|| sync.call_creator_jid.to_string())
+                } else {
+                    sync.call_creator_jid.to_string()
+                };
+                let canonical_peer = self.canonical_str(&peer);
+                let status = match sync.record.call_result {
+                    Some(wa::call_log_record::CallResult::Connected) => CallLogStatus::Connected,
+                    Some(wa::call_log_record::CallResult::Missed) => CallLogStatus::Missed,
+                    Some(wa::call_log_record::CallResult::Rejected) => CallLogStatus::Rejected,
+                    Some(wa::call_log_record::CallResult::Cancelled) => CallLogStatus::Cancelled,
+                    Some(wa::call_log_record::CallResult::Failed) => CallLogStatus::Failed,
+                    _ => CallLogStatus::Other,
+                };
+                let entry = CallLogEntry {
+                    call_id: sync.call_id.clone(),
+                    peer: canonical_peer,
+                    peer_name: None,
+                    from_me: sync.from_me,
+                    timestamp: sync.record.start_time.unwrap_or_else(|| sync.timestamp.timestamp()),
+                    duration: sync.record.duration.unwrap_or(0).max(0) as i64,
+                    is_video: sync.record.is_video.unwrap_or(false),
+                    status,
+                };
+                let _ = self.archive.insert_call_log(&entry);
+                self.emit_call_logs();
+            }
             E::OfflineSyncCompleted(_) => self.emit_chats(),
             _ => {}
         }
@@ -3401,6 +3444,52 @@ impl Worker {
             }
             return;
         }
+        if let Some(pin) = base.pin_in_chat_message.as_option() {
+            if let Some(key) = pin.key.as_option()
+                && let Some(target) = key.id.clone()
+            {
+                use wa::message::pin_in_chat_message::Type as PinType;
+                match pin.r#type {
+                    Some(PinType::PIN_FOR_ALL) => {
+                        let duration = base
+                            .message_context_info
+                            .as_option()
+                            .and_then(|ctx| ctx.message_add_on_duration_in_secs)
+                            .unwrap_or(604_800);
+                        let expires_at = Some(info.timestamp.timestamp() + duration as i64);
+                        let preview = self
+                            .archive
+                            .message(&chat, &target)
+                            .ok()
+                            .flatten()
+                            .map(|m| m.content.summary());
+                        let pinned = PinnedMessage {
+                            message_id: target,
+                            sender: Some(sender.clone()),
+                            timestamp: info.timestamp.timestamp(),
+                            expires_at,
+                            preview,
+                        };
+                        let _ = self.archive.set_pinned_message(&chat, Some(&pinned));
+                        self.emit(Event::MessagePinned {
+                            chat: chat.clone(),
+                            pinned: Some(pinned),
+                        });
+                        self.emit_chat(&chat);
+                    }
+                    Some(PinType::UNPIN_FOR_ALL) => {
+                        let _ = self.archive.set_pinned_message(&chat, None);
+                        self.emit(Event::MessagePinned {
+                            chat: chat.clone(),
+                            pinned: None,
+                        });
+                        self.emit_chat(&chat);
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
         if let Some(reaction) = base.reaction_message.as_option() {
             self.store_plain_reaction(
                 &chat,
@@ -3473,6 +3562,7 @@ impl Worker {
             mentions,
             forwarded: forwarded_of(base),
             thumbnail: thumbnail_of(base),
+            starred: false,
         };
         let is_poll = matches!(row.content, Content::Poll { .. });
         self.remember_poll(&row, message, &info.source.sender.to_non_ad_string(), None);
@@ -3909,6 +3999,7 @@ impl Worker {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            starred: false,
         };
         let id = row.id.clone();
         let chat = row.chat.clone();
@@ -4392,6 +4483,7 @@ impl Worker {
                     mentions,
                     forwarded: message.forwarded,
                     thumbnail: message.thumbnail,
+                    starred: false,
                 };
                 let mut poll_history_received = false;
                 let raw =
@@ -6284,7 +6376,286 @@ impl Worker {
             } => {
                 self.reply_story(sender, story_id, text, raw_message);
             }
+            Command::ToggleStarMessage { chat, id, starred } => {
+                let _ = self.archive.set_starred(&chat, &id, starred);
+                self.emit(Event::MessageStarred {
+                    chat: chat.clone(),
+                    id: id.clone(),
+                    starred,
+                });
+                if let Some(client) = self.client.clone() {
+                    let msg = self.archive.message(&chat, &id).ok().flatten();
+                    let from_me = msg.as_ref().map(|m| m.from_me).unwrap_or(true);
+                    let chat_jid = Self::jid_of(&chat);
+                    let is_group = chat_jid.as_ref().map(|j| j.is_group()).unwrap_or(false);
+                    let participant_jid = if is_group && !from_me {
+                        msg.as_ref().and_then(|m| Self::jid_of(&m.sender))
+                    } else {
+                        None
+                    };
+                    if let Some(chat_jid) = chat_jid {
+                        tokio::spawn(async move {
+                            let res = if starred {
+                                client
+                                    .chat_actions()
+                                    .star_message(&chat_jid, participant_jid.as_ref(), &id, from_me)
+                                    .await
+                            } else {
+                                client
+                                    .chat_actions()
+                                    .unstar_message(&chat_jid, participant_jid.as_ref(), &id, from_me)
+                                    .await
+                            };
+                            if let Err(e) = res {
+                                log::warn!("Failed to sync star update to WhatsApp: {e:?}");
+                            }
+                        });
+                    }
+                }
+            }
+            Command::FetchStarredMessages { chat } => {
+                let chat_ref = chat.as_deref();
+                match self.archive.starred_messages(chat_ref, 200) {
+                    Ok(messages) => {
+                        self.emit(Event::StarredMessages { chat, messages });
+                    }
+                    Err(e) => log::warn!("Failed to fetch starred messages: {e}"),
+                }
+            }
+            Command::PinMessage {
+                chat,
+                id,
+                duration_secs,
+            } => {
+                let preview = self
+                    .archive
+                    .message(&chat, &id)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.content.summary());
+                let pinned = PinnedMessage {
+                    message_id: id.clone(),
+                    sender: Some(self.me()),
+                    timestamp: crate::util::now(),
+                    expires_at: Some(crate::util::now() + duration_secs as i64),
+                    preview,
+                };
+                let _ = self.archive.set_pinned_message(&chat, Some(&pinned));
+                self.emit(Event::MessagePinned {
+                    chat: chat.clone(),
+                    pinned: Some(pinned),
+                });
+                self.emit_chat(&chat);
+
+                if let Some(client) = self.client.clone()
+                    && let Some(chat_jid) = Self::jid_of(&chat)
+                {
+                    let msg = self.archive.message(&chat, &id).ok().flatten();
+                    let from_me = msg.as_ref().map(|m| m.from_me).unwrap_or(true);
+                    let key = wa::MessageKey {
+                        remote_jid: Some(chat_jid.to_string()),
+                        from_me: Some(from_me),
+                        id: Some(id),
+                        participant: if chat_jid.is_group() && !from_me {
+                            msg.as_ref().map(|m| m.sender.clone())
+                        } else {
+                            None
+                        },
+                    };
+                    let duration = if duration_secs <= 86_400 {
+                        whatsapp_rust::send::PinDuration::Hours24
+                    } else if duration_secs <= 604_800 {
+                        whatsapp_rust::send::PinDuration::Days7
+                    } else {
+                        whatsapp_rust::send::PinDuration::Days30
+                    };
+                    tokio::spawn(async move {
+                        if let Err(e) = client.pin_message(chat_jid, key, duration).await {
+                            log::warn!("Failed to pin message on WhatsApp: {e:?}");
+                        }
+                    });
+                }
+            }
+            Command::UnpinMessage { chat, id } => {
+                let _ = self.archive.set_pinned_message(&chat, None);
+                self.emit(Event::MessagePinned {
+                    chat: chat.clone(),
+                    pinned: None,
+                });
+                self.emit_chat(&chat);
+
+                if let Some(client) = self.client.clone()
+                    && let Some(chat_jid) = Self::jid_of(&chat)
+                {
+                    let msg = self.archive.message(&chat, &id).ok().flatten();
+                    let from_me = msg.as_ref().map(|m| m.from_me).unwrap_or(true);
+                    let key = wa::MessageKey {
+                        remote_jid: Some(chat_jid.to_string()),
+                        from_me: Some(from_me),
+                        id: Some(id),
+                        participant: if chat_jid.is_group() && !from_me {
+                            msg.as_ref().map(|m| m.sender.clone())
+                        } else {
+                            None
+                        },
+                    };
+                    tokio::spawn(async move {
+                        if let Err(e) = client.unpin_message(chat_jid, key).await {
+                            log::warn!("Failed to unpin message on WhatsApp: {e:?}");
+                        }
+                    });
+                }
+            }
+            Command::RevokeStory(id) => {
+                self.revoke_story(id);
+            }
+            Command::BlockContact(jid) => {
+                if let Some(client) = self.client.clone() {
+                    if let Ok(target) = jid.parse::<Jid>() {
+                        let events = self.events.clone();
+                        let waker = self.waker.clone();
+                        let jid_str = jid.clone();
+                        tokio::spawn(async move {
+                            match client.blocking().block(&target).await {
+                                Ok(()) => {
+                                    let _ = events.send(Event::ContactBlocked {
+                                        jid: jid_str,
+                                        blocked: true,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = events.send(Event::Error(format!(
+                                        "Failed to block contact: {e}"
+                                    )));
+                                }
+                            }
+                            waker.wake();
+                        });
+                    }
+                }
+            }
+            Command::UnblockContact(jid) => {
+                if let Some(client) = self.client.clone() {
+                    if let Ok(target) = jid.parse::<Jid>() {
+                        let events = self.events.clone();
+                        let waker = self.waker.clone();
+                        let jid_str = jid.clone();
+                        tokio::spawn(async move {
+                            match client.blocking().unblock(&target).await {
+                                Ok(()) => {
+                                    let _ = events.send(Event::ContactBlocked {
+                                        jid: jid_str,
+                                        blocked: false,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = events.send(Event::Error(format!(
+                                        "Failed to unblock contact: {e}"
+                                    )));
+                                }
+                            }
+                            waker.wake();
+                        });
+                    }
+                }
+            }
+            Command::FetchBlocklist => {
+                self.fetch_blocklist();
+            }
+            Command::SetChatEphemeral {
+                chat,
+                duration_secs,
+            } => {
+                let _ = self
+                    .archive
+                    .set_ephemeral(&chat, duration_secs, crate::util::now());
+                self.emit(Event::ChatEphemeralUpdated {
+                    chat: chat.clone(),
+                    duration_secs: if duration_secs == 0 {
+                        None
+                    } else {
+                        Some(duration_secs)
+                    },
+                });
+                self.emit_chat(&chat);
+
+                if let Some(client) = self.client.clone()
+                    && let Some(chat_jid) = Self::jid_of(&chat)
+                {
+                    tokio::spawn(async move {
+                        if chat_jid.is_group() {
+                            if let Err(e) = client.groups().set_ephemeral(chat_jid, duration_secs).await {
+                                log::warn!("Failed to set group ephemeral timer: {e:?}");
+                            }
+                        } else if chat_jid.is_pn() || chat_jid.is_lid() {
+                            if let Err(e) = client.set_chat_disappearing_timer(chat_jid, duration_secs).await {
+                                log::warn!("Failed to set chat disappearing timer: {e:?}");
+                            }
+                        }
+                    });
+                }
+            }
+            Command::FetchCallLogs => {
+                self.emit_call_logs();
+            }
         }
+    }
+
+    fn fetch_blocklist(&self) {
+        if let Some(client) = self.client.clone() {
+            let events = self.events.clone();
+            let waker = self.waker.clone();
+            tokio::spawn(async move {
+                if let Ok(entries) = client.blocking().get_blocklist().await {
+                    let jids = entries.into_iter().map(|e| e.jid.to_string()).collect();
+                    let _ = events.send(Event::Blocklist(jids));
+                    waker.wake();
+                }
+            });
+        }
+    }
+
+    fn emit_call_logs(&mut self) {
+        if let Ok(mut logs) = self.archive.call_logs(100) {
+            for entry in &mut logs {
+                entry.peer_name = self.name_for(&entry.peer);
+            }
+            self.emit(Event::CallLogs(logs));
+        }
+    }
+
+    fn revoke_story(&mut self, id: String) {
+        if let Some(client) = self.client.clone() {
+            let mut recipient_set = std::collections::HashSet::new();
+            if let Ok(contacts) = self.archive.contacts() {
+                for c in contacts {
+                    if let Ok(jid) = c.id.parse::<Jid>() {
+                        if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                            recipient_set.insert(jid);
+                        }
+                    }
+                }
+            }
+            if let Ok(chats) = self.archive.chats() {
+                for c in chats {
+                    if c.kind == ChatKind::Direct {
+                        if let Ok(jid) = c.id.parse::<Jid>() {
+                            if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                                recipient_set.insert(jid);
+                            }
+                        }
+                    }
+                }
+            }
+            let recipients: Vec<Jid> = recipient_set.into_iter().collect();
+            let id_clone = id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = client.status().revoke(id_clone, &recipients, Default::default()).await {
+                    log::warn!("Failed to revoke status on WhatsApp: {e:?}");
+                }
+            });
+        }
+        self.emit(Event::StoryRevoked(id));
     }
 
     /// Replies to a status / story, sending a regular message to the contact quoting the story.
@@ -6365,6 +6736,7 @@ impl Worker {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            starred: false,
         };
 
         self.store_message(row, Some(message.encode_to_vec()), None);
@@ -6729,6 +7101,7 @@ impl Worker {
             mentions,
             forwarded: false,
             thumbnail: None,
+            starred: false,
         };
         self.store_message(row, Some(message.encode_to_vec()), None);
         tokio::spawn(send_outgoing(
@@ -9378,6 +9751,7 @@ pub(super) async fn file_outbound(
             .collect(),
         forwarded: false,
         thumbnail: prepared.thumbnail,
+        starred: false,
     };
     Ok((row, prepared.message.encode_to_vec()))
 }
@@ -9749,6 +10123,7 @@ mod tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            starred: false,
         }
     }
 
@@ -11503,6 +11878,7 @@ mod tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: Some(vec![1]),
+            starred: false,
         };
         let mention = MentionRef {
             user: "3".into(),
@@ -12357,6 +12733,7 @@ mod receipt_tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            starred: false,
         }
     }
 

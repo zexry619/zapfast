@@ -181,6 +181,30 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                         }
                         if theme::icon_button(
                             ui,
+                            Icon::Phone,
+                            18.0,
+                            palette.secondary,
+                            palette.text,
+                            "Calls",
+                        )
+                        .clicked()
+                        {
+                            app.actions.push(Action::ShowDialog(crate::model::Dialog::CallHistory));
+                        }
+                        if theme::icon_button(
+                            ui,
+                            Icon::Star,
+                            18.0,
+                            palette.secondary,
+                            palette.text,
+                            "Starred messages",
+                        )
+                        .clicked()
+                        {
+                            app.actions.push(Action::ShowDialog(crate::model::Dialog::StarredMessages { chat: None }));
+                        }
+                        if theme::icon_button(
+                            ui,
                             Icon::SquarePen,
                             18.0,
                             palette.secondary,

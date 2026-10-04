@@ -159,8 +159,29 @@ impl Worker {
         {
             runtime.last = update.clone();
         }
-        self.emit(Event::Call(Box::new(update)));
+        self.emit(Event::Call(Box::new(update.clone())));
         if finished {
+            let duration = update.started.map(|s| s.elapsed().as_secs() as i64).unwrap_or(0);
+            let status = match update.outcome {
+                Some(crate::calls::CallOutcome::Answered) => CallLogStatus::Connected,
+                Some(crate::calls::CallOutcome::Declined | crate::calls::CallOutcome::DeclinedElsewhere) => CallLogStatus::Rejected,
+                Some(crate::calls::CallOutcome::Missed | crate::calls::CallOutcome::NoAnswer) => CallLogStatus::Missed,
+                Some(crate::calls::CallOutcome::Failed | crate::calls::CallOutcome::Busy) => CallLogStatus::Failed,
+                _ => if duration > 0 { CallLogStatus::Connected } else { CallLogStatus::Other },
+            };
+            let call_id = format!("call-{}-{}", update.chat, crate::util::now());
+            let entry = CallLogEntry {
+                call_id,
+                peer: update.chat.clone(),
+                peer_name: None,
+                from_me: matches!(update.direction, crate::model::CallDirection::Outgoing),
+                timestamp: crate::util::now(),
+                duration,
+                is_video: update.video,
+                status,
+            };
+            let _ = self.archive.insert_call_log(&entry);
+            self.emit_call_logs();
             self.call = None;
         }
     }

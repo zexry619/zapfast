@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::model::{Chat, ChatKind, Contact, Content, Delivery, LastMessage, Message};
+use crate::model::{
+    CallLogEntry, CallLogStatus, Chat, ChatKind, Contact, Content, Delivery, LastMessage, Message,
+    PinnedMessage,
+};
 
 mod drafts;
 mod encryption;
@@ -122,6 +125,24 @@ CREATE TABLE IF NOT EXISTS group_receipts (
 CREATE TRIGGER IF NOT EXISTS delete_group_receipts AFTER DELETE ON messages BEGIN
     DELETE FROM group_receipts WHERE chat = OLD.chat AND id = OLD.id;
 END;
+CREATE TABLE IF NOT EXISTS call_logs (
+    call_id TEXT PRIMARY KEY,
+    peer TEXT NOT NULL,
+    from_me INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL,
+    duration INTEGER NOT NULL DEFAULT 0,
+    is_video INTEGER NOT NULL DEFAULT 0,
+    status INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS call_logs_by_time ON call_logs (timestamp DESC);
+CREATE TABLE IF NOT EXISTS pinned_messages (
+    chat TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL,
+    sender TEXT,
+    timestamp INTEGER NOT NULL,
+    expires_at INTEGER,
+    preview TEXT
+);
 ";
 
 const CHAT_COLUMNS: &str =
@@ -162,6 +183,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     // Set once the phone says it holds nothing older than what it sent.
     ("chats", "history_start", "INTEGER NOT NULL DEFAULT 0"),
     ("contacts", "first_name", "TEXT"),
+    ("messages", "starred", "INTEGER NOT NULL DEFAULT 0"),
 ];
 const CHAT_JOIN: &str = "FROM chats c
              LEFT JOIN messages m ON m.chat = c.id AND m.rowid = (
@@ -218,11 +240,12 @@ fn chat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chat> {
         left: row.get(22)?,
         info_locked: row.get(23)?,
         admin: row.get(24)?,
+        pinned_message: None,
     })
 }
 
 /// The columns [`searched_message`] reads, in its order.
-const SEARCH_COLUMNS: &str = "chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at";
+const SEARCH_COLUMNS: &str = "chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at, starred";
 
 /// The lowercased text a search matches: text, captions, file names, poll
 /// questions, contact names and places, one per line.
@@ -277,6 +300,7 @@ fn searched_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         mentions: serde_json::from_str(&mentions).unwrap_or_default(),
         forwarded: row.get(13)?,
         thumbnail: row.get(11)?,
+        starred: row.get::<_, Option<i64>>(16)?.unwrap_or(0) != 0,
     })
 }
 
@@ -762,14 +786,22 @@ impl Archive {
             "SELECT {CHAT_COLUMNS} {CHAT_JOIN} ORDER BY c.last_activity DESC"
         ))?;
         let rows = statement.query_map([], chat_from_row)?;
-        rows.collect()
+        let mut list: Vec<Chat> = rows.collect::<Result<Vec<Chat>>>()?;
+        for c in &mut list {
+            c.pinned_message = self.pinned_message(&c.id).ok().flatten();
+        }
+        Ok(list)
     }
 
     pub fn chat(&self, id: &str) -> Result<Option<Chat>> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT {CHAT_COLUMNS} {CHAT_JOIN} WHERE c.id = ?1"
         ))?;
-        statement.query_row(params![id], chat_from_row).optional()
+        let mut c: Option<Chat> = statement.query_row(params![id], chat_from_row).optional()?;
+        if let Some(chat) = c.as_mut() {
+            chat.pinned_message = self.pinned_message(&chat.id).ok().flatten();
+        }
+        Ok(c)
     }
 
     pub fn bump_unread(&self, id: &str) -> Result<()> {
@@ -920,8 +952,8 @@ impl Archive {
     /// write instead of a read followed by a write.
     pub fn insert_message(&self, message: &Message, raw: Option<&[u8]>) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO messages (chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            "INSERT INTO messages (chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at, starred)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?19)
              ON CONFLICT(chat, id) DO UPDATE SET
                 sender_name = COALESCE(excluded.sender_name, sender_name),
                 content = excluded.content,
@@ -941,7 +973,8 @@ impl Archive {
                 mentions = excluded.mentions,
                 forwarded = excluded.forwarded,
                 delivered_at = COALESCE(delivered_at, excluded.delivered_at),
-                read_at = COALESCE(read_at, excluded.read_at)",
+                read_at = COALESCE(read_at, excluded.read_at),
+                starred = CASE WHEN excluded.starred != 0 THEN excluded.starred ELSE messages.starred END",
             params![
                 message.chat,
                 message.id,
@@ -965,6 +998,7 @@ impl Archive {
                 message.read_at,
                 // An explicit failure still writes over a further state.
                 status_rank(Delivery::Failed),
+                message.starred as i64,
             ],
         )?;
         self.connection.execute(
@@ -983,7 +1017,7 @@ impl Archive {
         limit: usize,
     ) -> Result<Vec<Message>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at
+            "SELECT id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at, starred
              FROM messages
              WHERE chat = ?1 AND (timestamp < ?2 OR (timestamp = ?2 AND rowid <
                  (SELECT rowid FROM messages WHERE chat = ?1 AND id = ?3)))
@@ -1016,6 +1050,7 @@ impl Archive {
                     mentions: serde_json::from_str(&mentions).unwrap_or_default(),
                     forwarded: row.get(12)?,
                     thumbnail: row.get(10)?,
+                    starred: row.get::<_, Option<i64>>(15)?.unwrap_or(0) != 0,
                 })
             })?;
         let mut messages: Vec<Message> = rows.collect::<Result<_>>()?;
@@ -1088,7 +1123,7 @@ impl Archive {
         limit: usize,
     ) -> Result<Vec<Message>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at
+            "SELECT id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at, starred
              FROM messages
              WHERE chat = ?1 AND timestamp >= ?2 AND (timestamp < ?3 OR (timestamp = ?3 AND rowid <
                  (SELECT rowid FROM messages WHERE chat = ?1 AND id = ?4)))
@@ -1121,6 +1156,7 @@ impl Archive {
                     mentions: serde_json::from_str(&mentions).unwrap_or_default(),
                     forwarded: row.get(12)?,
                     thumbnail: row.get(10)?,
+                    starred: row.get::<_, Option<i64>>(15)?.unwrap_or(0) != 0,
                 })
             },
         )?;
@@ -1456,7 +1492,7 @@ impl Archive {
 
     pub fn message(&self, chat: &str, id: &str) -> Result<Option<Message>> {
         let mut statement = self.connection.prepare(
-            "SELECT sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at
+            "SELECT sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, thumbnail, mentions, forwarded, delivered_at, read_at, starred
              FROM messages WHERE chat = ?1 AND id = ?2",
         )?;
         statement
@@ -1484,9 +1520,145 @@ impl Archive {
                     mentions: serde_json::from_str(&mentions).unwrap_or_default(),
                     forwarded: row.get(11)?,
                     thumbnail: row.get(9)?,
+                    starred: row.get::<_, Option<i64>>(14)?.unwrap_or(0) != 0,
                 })
             })
             .optional()
+    }
+
+    /// Sets whether a message is starred.
+    pub fn set_starred(&self, chat: &str, id: &str, starred: bool) -> Result<()> {
+        self.connection.execute(
+            "UPDATE messages SET starred = ?3 WHERE chat = ?1 AND id = ?2",
+            params![chat, id, starred as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Returns starred messages, optionally filtered by chat.
+    pub fn starred_messages(&self, chat: Option<&str>, limit: usize) -> Result<Vec<Message>> {
+        let (sql, params_vec): (String, Vec<rusqlite::types::Value>) = if let Some(chat) = chat {
+            (
+                format!(
+                    "SELECT {SEARCH_COLUMNS} FROM messages WHERE chat = ?1 AND starred = 1 ORDER BY timestamp DESC LIMIT ?2"
+                ),
+                vec![chat.to_string().into(), (limit as i64).into()],
+            )
+        } else {
+            (
+                format!(
+                    "SELECT {SEARCH_COLUMNS} FROM messages WHERE starred = 1 ORDER BY timestamp DESC LIMIT ?1"
+                ),
+                vec![(limit as i64).into()],
+            )
+        };
+        let mut stmt = self.connection.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), searched_message)?;
+        rows.collect()
+    }
+
+    /// Sets or clears the pinned message for a chat.
+    pub fn set_pinned_message(&self, chat: &str, pinned: Option<&PinnedMessage>) -> Result<()> {
+        if let Some(p) = pinned {
+            self.connection.execute(
+                "INSERT INTO pinned_messages (chat, message_id, sender, timestamp, expires_at, preview)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(chat) DO UPDATE SET
+                    message_id = excluded.message_id,
+                    sender = excluded.sender,
+                    timestamp = excluded.timestamp,
+                    expires_at = excluded.expires_at,
+                    preview = excluded.preview",
+                params![chat, p.message_id, p.sender, p.timestamp, p.expires_at, p.preview],
+            )?;
+        } else {
+            self.connection.execute(
+                "DELETE FROM pinned_messages WHERE chat = ?1",
+                params![chat],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Retrieves the pinned message for a chat, if any.
+    pub fn pinned_message(&self, chat: &str) -> Result<Option<PinnedMessage>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT message_id, sender, timestamp, expires_at, preview FROM pinned_messages WHERE chat = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![chat], |row| {
+            Ok(PinnedMessage {
+                message_id: row.get(0)?,
+                sender: row.get(1)?,
+                timestamp: row.get(2)?,
+                expires_at: row.get(3)?,
+                preview: row.get(4)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(p)) => Ok(Some(p)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Inserts or updates a call log entry.
+    pub fn insert_call_log(&self, entry: &CallLogEntry) -> Result<()> {
+        let status_code: i64 = match entry.status {
+            CallLogStatus::Connected => 0,
+            CallLogStatus::Missed => 1,
+            CallLogStatus::Rejected => 2,
+            CallLogStatus::Cancelled => 3,
+            CallLogStatus::Failed => 4,
+            CallLogStatus::Other => 5,
+        };
+        self.connection.execute(
+            "INSERT INTO call_logs (call_id, peer, from_me, timestamp, duration, is_video, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(call_id) DO UPDATE SET
+                duration = MAX(call_logs.duration, excluded.duration),
+                status = excluded.status",
+            params![
+                entry.call_id,
+                entry.peer,
+                entry.from_me as i64,
+                entry.timestamp,
+                entry.duration,
+                entry.is_video as i64,
+                status_code,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the most recent call logs.
+    pub fn call_logs(&self, limit: usize) -> Result<Vec<CallLogEntry>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT call_id, peer, from_me, timestamp, duration, is_video, status
+             FROM call_logs
+             ORDER BY timestamp DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let status_code: i64 = row.get(6)?;
+            let status = match status_code {
+                0 => CallLogStatus::Connected,
+                1 => CallLogStatus::Missed,
+                2 => CallLogStatus::Rejected,
+                3 => CallLogStatus::Cancelled,
+                4 => CallLogStatus::Failed,
+                _ => CallLogStatus::Other,
+            };
+            Ok(CallLogEntry {
+                call_id: row.get(0)?,
+                peer: row.get(1)?,
+                peer_name: None,
+                from_me: row.get::<_, i64>(2)? != 0,
+                timestamp: row.get(3)?,
+                duration: row.get(4)?,
+                is_video: row.get::<_, i64>(5)? != 0,
+                status,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Returns the earliest message for phone-history requests.
@@ -1766,6 +1938,7 @@ pub(crate) mod tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            starred: false,
         }
     }
 
@@ -3282,6 +3455,7 @@ mod sticker_tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            starred: false,
         }
     }
 
@@ -3458,6 +3632,7 @@ mod media_path_tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            starred: false,
         }
     }
 

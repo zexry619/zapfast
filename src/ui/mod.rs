@@ -653,6 +653,7 @@ mod idle_tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            starred: false,
         });
         conversation.complete = true;
         app.conversations.insert(chat.id.clone(), conversation);
@@ -711,6 +712,7 @@ mod idle_tests {
                 mentions: Vec::new(),
                 forwarded: false,
                 thumbnail: None,
+                starred: false,
             });
         }
         conversation.complete = true;

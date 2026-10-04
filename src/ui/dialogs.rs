@@ -1,6 +1,6 @@
 //! Shortcuts, account, linking, contact, and chat dialogs.
 
-use egui::{Align, CornerRadius, Frame, Layout, Margin, Sense, Stroke, pos2, vec2};
+use egui::{Align, Align2, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, Vec2, pos2, vec2};
 
 use crate::app::App;
 use crate::model::{Action, Dialog};
@@ -47,6 +47,10 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     420.0_f32.min((ui.ctx().content_rect().width() - 64.0).max(180.0))
                 }
                 Dialog::Labels => 460.0,
+                Dialog::StarredMessages { .. } => 460.0,
+                Dialog::PinMessage { .. } => 380.0,
+                Dialog::CallHistory => 460.0,
+                Dialog::DisappearingMessages(_) => 380.0,
             });
             ui.spacing_mut().item_spacing.y = 8.0;
             match dialog {
@@ -86,6 +90,22 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::MessageInfo { chat, message } => {
                     super::message_info::show(app, ui, &chat, &message)
                 }
+                Dialog::StarredMessages { chat } => starred_messages_dialog(app, ui, chat),
+                Dialog::CallHistory => call_history_dialog(app, ui),
+                Dialog::PinMessage {
+                    chat,
+                    message_id,
+                    from_me,
+                    participant,
+                } => pin_message_dialog(
+                    app,
+                    ui,
+                    &chat,
+                    &message_id,
+                    from_me,
+                    participant.as_deref(),
+                ),
+                Dialog::DisappearingMessages(chat) => disappearing_messages_dialog(app, ui, &chat),
             }
         });
     if response.should_close() {
@@ -1920,6 +1940,32 @@ fn chat_info(app: &mut App, ui: &mut egui::Ui, id: &str) {
                 Action::CloseDialog,
             ],
         ));
+        buttons.push((
+            Icon::Clock,
+            "Disappearing",
+            vec![Action::ShowDialog(Dialog::DisappearingMessages(
+                chat.id.clone(),
+            ))],
+        ));
+        buttons.push((
+            Icon::Star,
+            "Starred",
+            vec![Action::ShowDialog(Dialog::StarredMessages {
+                chat: Some(chat.id.clone()),
+            })],
+        ));
+    }
+    if !chat.is_group() && !mine {
+        let is_blocked = app.blocked_contacts.contains(id);
+        buttons.push((
+            Icon::Ban,
+            if is_blocked { "Unblock" } else { "Block" },
+            vec![if is_blocked {
+                Action::UnblockContact(id.to_owned())
+            } else {
+                Action::BlockContact(id.to_owned())
+            }],
+        ));
     }
     let spacing = ui.spacing().item_spacing.x;
     let available = ui.available_width();
@@ -2127,6 +2173,364 @@ pub(super) fn danger_button(ui: &mut egui::Ui, app: &mut App, label: &str) -> bo
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked()
+}
+
+fn starred_messages_dialog(app: &mut App, ui: &mut egui::Ui, chat: Option<String>) {
+    let palette = app.palette;
+    title(ui, app, &crate::i18n::gettext(app.locale, "Starred messages"));
+    ui.add_space(4.0);
+
+    if app.starred_filter_chat != chat {
+        app.starred_filter_chat = chat.clone();
+        app.actions.push(Action::FetchStarredMessages(chat.clone()));
+    }
+
+    let messages = &app.starred_messages;
+    if messages.is_empty() {
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+            theme::paint_icon(
+                ui,
+                Icon::Star,
+                icon_rect,
+                24.0,
+                palette.dim,
+            );
+            ui.add_space(8.0);
+            theme::text(
+                ui,
+                "No starred messages yet",
+                theme::medium(14.0),
+                palette.secondary,
+            );
+            theme::text(
+                ui,
+                "Right-click any message to star it.",
+                theme::regular(12.0),
+                palette.dim,
+            );
+        });
+        ui.add_space(20.0);
+        return;
+    }
+
+    let row_height = 54.0;
+    let max_height = 360.0;
+    let mut jump = None;
+    let mut unstar = None;
+
+    egui::ScrollArea::vertical()
+        .id_salt("starred_messages_list")
+        .max_height(max_height)
+        .auto_shrink([false, false])
+        .show_rows(ui, row_height, messages.len(), |ui, range| {
+            for m in &messages[range] {
+                let (rect, resp) = ui.allocate_exact_size(
+                    vec2(ui.available_width(), row_height),
+                    Sense::click(),
+                );
+                if ui.is_rect_visible(rect) {
+                    if resp.hovered() {
+                        super::widgets::dialog_row_highlight(ui, rect, palette.surface_hover);
+                    }
+                    let sender_title = m.sender_name.as_deref().unwrap_or(&m.sender);
+                    let chat_title = app
+                        .chats
+                        .iter()
+                        .find(|c| c.id == m.chat)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| m.chat.clone());
+                    let header_line = format!("{sender_title} • {chat_title}");
+
+                    let time_str = crate::util::chat_stamp(app.locale, m.timestamp);
+                    let summary = m.content.summary();
+
+                    ui.painter().text(
+                        pos2(rect.left() + 8.0, rect.top() + 6.0),
+                        Align2::LEFT_TOP,
+                        header_line,
+                        theme::bold(12.0),
+                        palette.accent,
+                    );
+                    ui.painter().text(
+                        pos2(rect.right() - 8.0, rect.top() + 6.0),
+                        Align2::RIGHT_TOP,
+                        time_str,
+                        theme::regular(11.0),
+                        palette.dim,
+                    );
+                    let line = super::widgets::line(
+                        ui,
+                        &summary,
+                        theme::regular(13.0),
+                        palette.text,
+                        rect.width() - 40.0,
+                        1,
+                    );
+                    line.paint(
+                        ui,
+                        pos2(rect.left() + 8.0, rect.top() + 24.0),
+                        palette.text,
+                    );
+
+                    let unstar_rect = Rect::from_center_size(
+                        pos2(rect.right() - 16.0, rect.center().y + 8.0),
+                        Vec2::splat(16.0),
+                    );
+                    theme::paint_icon(ui, Icon::Star, unstar_rect, 13.0, palette.accent);
+                }
+                if resp.clicked() {
+                    jump = Some((m.chat.clone(), m.id.clone()));
+                }
+                if resp.secondary_clicked() {
+                    unstar = Some((m.chat.clone(), m.id.clone()));
+                }
+            }
+        });
+
+    if let Some((chat_id, msg_id)) = jump {
+        app.actions.push(Action::OpenChat(chat_id));
+        app.actions.push(Action::ScrollTo(msg_id));
+        app.actions.push(Action::CloseDialog);
+    }
+    if let Some((chat_id, msg_id)) = unstar {
+        app.actions.push(Action::ToggleStarMessage {
+            chat: chat_id,
+            message: msg_id,
+            participant: None,
+            from_me: false,
+            starred: false,
+        });
+    }
+}
+
+fn pin_message_dialog(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    chat: &str,
+    id: &str,
+    from_me: bool,
+    participant: Option<&str>,
+) {
+    let palette = app.palette;
+    title(ui, app, &crate::i18n::gettext(app.locale, "Pin message"));
+    ui.add_space(4.0);
+    theme::text(
+        ui,
+        "Choose how long your pin lasts. Pinned messages are visible to everyone in the chat.",
+        theme::regular(13.0),
+        palette.secondary,
+    );
+    ui.add_space(12.0);
+
+    let options = [
+        ("24 Hours", 86_400),
+        ("7 Days", 604_800),
+        ("30 Days", 2_592_000),
+    ];
+
+    for (label, secs) in options {
+        if theme::pill_button(ui, &palette, label, false).clicked() {
+            app.actions.push(Action::PinMessage {
+                chat: chat.to_owned(),
+                message_id: id.to_owned(),
+                from_me,
+                participant: participant.map(str::to_owned),
+                duration: secs,
+            });
+            app.actions.push(Action::CloseDialog);
+        }
+        ui.add_space(4.0);
+    }
+}
+
+fn call_history_dialog(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    title(ui, app, &crate::i18n::gettext(app.locale, "Calls"));
+    ui.add_space(4.0);
+
+    if app.call_logs.is_empty() {
+        app.actions.push(Action::FetchCallLogs);
+    }
+
+    let logs = &app.call_logs;
+    if logs.is_empty() {
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+            theme::paint_icon(
+                ui,
+                Icon::Phone,
+                icon_rect,
+                24.0,
+                palette.dim,
+            );
+            ui.add_space(8.0);
+            theme::text(
+                ui,
+                "No call history yet",
+                theme::medium(14.0),
+                palette.secondary,
+            );
+        });
+        ui.add_space(20.0);
+        return;
+    }
+
+    let row_height = 46.0;
+    let max_height = 360.0;
+    let mut call_peer = None;
+
+    egui::ScrollArea::vertical()
+        .id_salt("call_history_list")
+        .max_height(max_height)
+        .auto_shrink([false, false])
+        .show_rows(ui, row_height, logs.len(), |ui, range| {
+            for log in &logs[range] {
+                let (rect, resp) = ui.allocate_exact_size(
+                    vec2(ui.available_width(), row_height),
+                    Sense::click(),
+                );
+                if ui.is_rect_visible(rect) {
+                    if resp.hovered() {
+                        super::widgets::dialog_row_highlight(ui, rect, palette.surface_hover);
+                    }
+                    let icon = if log.is_video {
+                        Icon::Video
+                    } else {
+                        Icon::Phone
+                    };
+                    let status_color = match log.status {
+                        crate::model::CallLogStatus::Missed => palette.danger,
+                        crate::model::CallLogStatus::Connected => palette.accent,
+                        _ => palette.secondary,
+                    };
+
+                    let icon_rect = Rect::from_center_size(
+                        pos2(rect.left() + 18.0, rect.center().y),
+                        Vec2::splat(20.0),
+                    );
+                    theme::paint_icon(ui, icon, icon_rect, 16.0, status_color);
+
+                    let name = log.peer_name.as_deref().unwrap_or(&log.peer);
+                    let dir_str = if log.from_me {
+                        "Outgoing"
+                    } else {
+                        "Incoming"
+                    };
+                    let status_str = match log.status {
+                        crate::model::CallLogStatus::Missed => "Missed".to_string(),
+                        crate::model::CallLogStatus::Connected => {
+                            if log.duration > 0 {
+                                format!(
+                                    "{dir_str} ({}m {}s)",
+                                    log.duration / 60,
+                                    log.duration % 60
+                                )
+                            } else {
+                                dir_str.to_string()
+                            }
+                        }
+                        crate::model::CallLogStatus::Rejected => "Declined".to_string(),
+                        crate::model::CallLogStatus::Cancelled => "Cancelled".to_string(),
+                        crate::model::CallLogStatus::Failed => "Failed".to_string(),
+                        crate::model::CallLogStatus::Other => dir_str.to_string(),
+                    };
+
+                    ui.painter().text(
+                        pos2(rect.left() + 40.0, rect.top() + 6.0),
+                        Align2::LEFT_TOP,
+                        name,
+                        theme::bold(13.0),
+                        palette.text,
+                    );
+                    ui.painter().text(
+                        pos2(rect.left() + 40.0, rect.top() + 24.0),
+                        Align2::LEFT_TOP,
+                        status_str,
+                        theme::regular(11.5),
+                        status_color,
+                    );
+
+                    let time_str = crate::util::chat_stamp(app.locale, log.timestamp);
+                    ui.painter().text(
+                        pos2(rect.right() - 8.0, rect.top() + 6.0),
+                        Align2::RIGHT_TOP,
+                        time_str,
+                        theme::regular(11.0),
+                        palette.dim,
+                    );
+                }
+                if resp.clicked() {
+                    call_peer = Some((log.peer.clone(), log.is_video));
+                }
+            }
+        });
+
+    if let Some((peer, video)) = call_peer {
+        app.actions.push(if video {
+            Action::StartVideoCall(peer)
+        } else {
+            Action::StartCall(peer)
+        });
+        app.actions.push(Action::CloseDialog);
+    }
+}
+
+fn disappearing_messages_dialog(app: &mut App, ui: &mut egui::Ui, chat: &str) {
+    let palette = app.palette;
+    title(
+        ui,
+        app,
+        &crate::i18n::gettext(app.locale, "Disappearing messages"),
+    );
+    ui.add_space(4.0);
+    theme::text(
+        ui,
+        "Make messages in this chat disappear after a set time. New messages will disappear for everyone.",
+        theme::regular(13.0),
+        palette.secondary,
+    );
+    ui.add_space(12.0);
+
+    let current = app
+        .chats
+        .iter()
+        .find(|c| c.id == chat)
+        .and_then(|c| c.ephemeral_expiration)
+        .unwrap_or(0);
+
+    let options = [
+        ("24 Hours", 86_400),
+        ("7 Days", 604_800),
+        ("90 Days", 7_776_000),
+        ("Off", 0),
+    ];
+
+    for (label, secs) in options {
+        let is_selected = current == secs;
+        if theme::soft_button(
+            ui,
+            &palette,
+            if is_selected {
+                Some(Icon::Check)
+            } else {
+                None
+            },
+            label,
+            is_selected,
+        )
+        .clicked()
+        {
+            app.actions.push(Action::SetChatEphemeral {
+                chat: chat.to_owned(),
+                duration: secs,
+            });
+            app.actions.push(Action::CloseDialog);
+        }
+        ui.add_space(4.0);
+    }
 }
 
 #[cfg(test)]

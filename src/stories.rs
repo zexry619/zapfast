@@ -94,6 +94,35 @@ impl StoriesStore {
         }
     }
 
+    /// Removes a specific story item by id.
+    pub fn remove(&mut self, sender: &str, id: &str) -> bool {
+        if let Some(list) = self.stories_by_sender.get_mut(sender) {
+            let before = list.len();
+            list.retain(|item| item.id != id);
+            let removed = list.len() < before;
+            if list.is_empty() {
+                self.stories_by_sender.remove(sender);
+            }
+            removed
+        } else {
+            false
+        }
+    }
+
+    /// Removes a story from any sender that matches id.
+    pub fn remove_story(&mut self, id: &str) -> bool {
+        let mut any_removed = false;
+        self.stories_by_sender.retain(|_, items| {
+            let before = items.len();
+            items.retain(|item| item.id != id);
+            if items.len() < before {
+                any_removed = true;
+            }
+            !items.is_empty()
+        });
+        any_removed
+    }
+
     /// Removes stories older than 24 hours (86,400 seconds).
     pub fn clean_expired(&mut self, now_secs: u64) {
         let cutoff = now_secs.saturating_sub(24 * 3600);

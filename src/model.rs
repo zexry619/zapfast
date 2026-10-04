@@ -131,6 +131,16 @@ impl ChatFilter {
     }
 }
 
+/// Pinned message in a chat.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PinnedMessage {
+    pub message_id: String,
+    pub sender: Option<String>,
+    pub timestamp: i64,
+    pub expires_at: Option<i64>,
+    pub preview: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Chat {
     pub id: ChatId,
@@ -179,6 +189,8 @@ pub struct Chat {
     pub labels: Vec<String>,
     /// This chat's own notification sound; `None` follows Settings.
     pub notification_sound: Option<crate::settings::NotificationSound>,
+    /// Message pinned in this chat.
+    pub pinned_message: Option<PinnedMessage>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -221,6 +233,7 @@ impl Chat {
             ephemeral_expiration: None,
             labels: Vec::new(),
             notification_sound: None,
+            pinned_message: None,
         }
     }
 
@@ -342,6 +355,9 @@ pub struct Message {
     /// JPEG preview sent with an attachment or link.
     #[serde(default)]
     pub thumbnail: Option<Vec<u8>>,
+    /// Whether this message is starred by the user.
+    #[serde(default)]
+    pub starred: bool,
 }
 
 /// Raw WhatsApp mention token and its canonical id.
@@ -982,6 +998,30 @@ pub enum CallDirection {
     Outgoing,
 }
 
+/// Status of a logged call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallLogStatus {
+    Connected,
+    Missed,
+    Rejected,
+    Cancelled,
+    Failed,
+    Other,
+}
+
+/// An entry in the call history.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CallLogEntry {
+    pub call_id: String,
+    pub peer: String,
+    pub peer_name: Option<String>,
+    pub from_me: bool,
+    pub timestamp: i64,
+    pub duration: i64,
+    pub is_video: bool,
+    pub status: CallLogStatus,
+}
+
 /// The tabs of the picker above the composer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PickerTab {
@@ -1172,6 +1212,21 @@ pub enum Dialog {
         chat: ChatId,
         message: String,
     },
+    /// Starred messages list, optionally filtered by chat.
+    StarredMessages {
+        chat: Option<ChatId>,
+    },
+    /// Pin message duration picker.
+    PinMessage {
+        chat: ChatId,
+        message_id: String,
+        from_me: bool,
+        participant: Option<String>,
+    },
+    /// List of call history logs.
+    CallHistory,
+    /// Disappearing messages timer settings for a chat.
+    DisappearingMessages(ChatId),
 }
 
 /// One recipient's receipts for one of our group messages.
@@ -1843,6 +1898,44 @@ pub enum Action {
     RemovePending(usize),
     /// Removes all pending attachments.
     ClearPending,
+    /// Toggles or sets starred state on a message.
+    ToggleStarMessage {
+        chat: ChatId,
+        message: String,
+        participant: Option<String>,
+        from_me: bool,
+        starred: bool,
+    },
+    /// Pins a message in a chat with a specific duration (seconds).
+    PinMessage {
+        chat: ChatId,
+        message_id: String,
+        from_me: bool,
+        participant: Option<String>,
+        duration: u32,
+    },
+    /// Unpins a message in a chat.
+    UnpinMessage {
+        chat: ChatId,
+        message_id: String,
+        from_me: bool,
+        participant: Option<String>,
+    },
+    /// Revokes (deletes) our own posted status update.
+    RevokeStory(String),
+    /// Blocks a contact.
+    BlockContact(String),
+    /// Unblocks a contact.
+    UnblockContact(String),
+    /// Sets disappearing message expiration duration on a chat.
+    SetChatEphemeral {
+        chat: ChatId,
+        duration: u32,
+    },
+    /// Fetches call logs from local database.
+    FetchCallLogs,
+    /// Fetches starred messages from local database.
+    FetchStarredMessages(Option<ChatId>),
 }
 
 #[cfg(test)]

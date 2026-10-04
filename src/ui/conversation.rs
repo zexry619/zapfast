@@ -45,6 +45,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     if theme::macos_chrome(ui.ctx()) {
         super::banner(app, ui);
     }
+    pinned_banner(app, ui, &chat);
     composer(app, ui, &chat);
     messages(app, ui, &chat);
     // Over the messages, which scroll under the header.
@@ -65,6 +66,55 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         header.bottom(),
         ui.max_rect().bottom(),
     );
+}
+
+fn pinned_banner(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
+    let Some(pinned) = &chat.pinned_message else {
+        return;
+    };
+    let palette = app.palette;
+    egui::Panel::top("conversation_pinned_message")
+        .frame(
+            Frame::new()
+                .fill(palette.surface)
+                .stroke(Stroke::new(1.0, palette.outline))
+                .inner_margin(Margin::symmetric(14, 6)),
+        )
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (icon_rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                theme::paint_icon(ui, Icon::Pin, icon_rect, 13.0, palette.accent);
+                ui.add_space(4.0);
+                let sender = pinned.sender.as_deref().unwrap_or("Pinned message");
+                let preview = pinned.preview.as_deref().unwrap_or("Message");
+                let label = format!("{sender}: {preview}");
+                let resp = ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(label)
+                                .font(theme::medium(12.5))
+                                .color(palette.text),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if resp.clicked() {
+                    app.actions.push(Action::ScrollTo(pinned.message_id.clone()));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::icon_button(ui, Icon::X, 14.0, palette.secondary, palette.text, "Unpin")
+                        .clicked()
+                    {
+                        app.actions.push(Action::UnpinMessage {
+                            chat: chat.id.clone(),
+                            message_id: pinned.message_id.clone(),
+                            from_me: true,
+                            participant: None,
+                        });
+                    }
+                });
+            });
+        });
 }
 
 fn empty(app: &mut App, ui: &mut egui::Ui) {
@@ -242,6 +292,9 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                             "Pin to top",
                             "Unarchive",
                             "Clear chat",
+                            "Starred messages",
+                            "Disappearing messages",
+                            "Block contact",
                             leave_label.as_ref(),
                             "Copy number",
                             "Close chat",
@@ -296,6 +349,29 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                                     .push(Action::ShowDialog(Dialog::ConfirmClearChat(
                                         chat.id.clone(),
                                     )));
+                            }
+                            if widgets::menu_item(ui, &palette, Some(Icon::Star), "Starred messages") {
+                                app.actions.push(Action::ShowDialog(Dialog::StarredMessages {
+                                    chat: Some(chat.id.clone()),
+                                }));
+                            }
+                            if widgets::menu_item(ui, &palette, Some(Icon::Timer), "Disappearing messages") {
+                                app.actions.push(Action::ShowDialog(Dialog::DisappearingMessages(chat.id.clone())));
+                            }
+                            if !chat.is_group() && !chat.is_channel() {
+                                let is_blocked = app.blocked_contacts.contains(&chat.id);
+                                let (b_icon, b_label) = if is_blocked {
+                                    (Icon::Ban, "Unblock contact")
+                                } else {
+                                    (Icon::Ban, "Block contact")
+                                };
+                                if widgets::menu_item(ui, &palette, Some(b_icon), b_label) {
+                                    app.actions.push(if is_blocked {
+                                        Action::UnblockContact(chat.id.clone())
+                                    } else {
+                                        Action::BlockContact(chat.id.clone())
+                                    });
+                                }
                             }
                             widgets::menu_separator(ui, &palette);
                             if chat.can_leave(&app.our_ids())
@@ -3745,7 +3821,8 @@ fn footer_width(ui: &egui::Ui, message: &Message) -> f32 {
     } else {
         0.0
     };
-    time + edited + not_sent + if message.from_me { 19.0 } else { 0.0 }
+    let star_width = if message.starred { 14.0 } else { 0.0 };
+    time + edited + not_sent + if message.from_me { 19.0 } else { 0.0 } + star_width
 }
 
 /// Whether the message's time and ticks sit over its picture rather than
@@ -3770,8 +3847,9 @@ fn footer_over_picture(ui: &mut egui::Ui, palette: &Palette, message: &Message, 
             .layout_no_wrap(NOT_SENT.to_owned(), theme::medium(11.0), Color32::WHITE)
     });
     let tick_width = if message.from_me { 19.0 } else { 0.0 };
+    let star_width = if message.starred { 14.0 } else { 0.0 };
     let width =
-        time.size().x + failed.as_ref().map_or(0.0, |galley| galley.size().x + 6.0) + tick_width;
+        time.size().x + failed.as_ref().map_or(0.0, |galley| galley.size().x + 6.0) + tick_width + star_width;
     let row = Rect::from_min_max(
         pos2(
             picture.right() - OVER_PICTURE_INSET.x - width,
@@ -3789,6 +3867,11 @@ fn footer_over_picture(ui: &mut egui::Ui, palette: &Palette, message: &Message, 
         let ticks = Rect::from_center_size(pos2(x - 7.5, row.center().y), Vec2::splat(15.0));
         widgets::ticks_in(ui, palette, ticks, message.status, Color32::WHITE);
         x -= tick_width;
+    }
+    if message.starred {
+        let star_rect = Rect::from_center_size(pos2(x - 7.0, row.center().y), Vec2::splat(12.0));
+        theme::paint_icon(ui, Icon::Star, star_rect, 10.0, Color32::WHITE);
+        x -= star_width;
     }
     x -= time.size().x;
     ui.painter().galley(
@@ -3848,10 +3931,12 @@ fn footer(ui: &mut egui::Ui, palette: &Palette, message: &Message, slot: Option<
             .layout_no_wrap(NOT_SENT.to_owned(), theme::medium(11.0), palette.text)
     });
     let tick_width = if message.from_me { 19.0 } else { 0.0 };
+    let star_width = if message.starred { 14.0 } else { 0.0 };
     let width = time.size().x
         + edited.as_ref().map_or(0.0, |galley| galley.size().x + 4.0)
         + failed.as_ref().map_or(0.0, |galley| galley.size().x + 6.0)
-        + tick_width;
+        + tick_width
+        + star_width;
     let rect = match slot {
         Some(slot) => slot,
         None => {
@@ -3871,6 +3956,11 @@ fn footer(ui: &mut egui::Ui, palette: &Palette, message: &Message, slot: Option<
         let ticks = Rect::from_center_size(pos2(x - 7.5, rect.center().y), Vec2::splat(15.0));
         widgets::ticks(ui, palette, ticks, message.status);
         x -= tick_width;
+    }
+    if message.starred {
+        let star_rect = Rect::from_center_size(pos2(x - 7.0, rect.center().y), Vec2::splat(12.0));
+        theme::paint_icon(ui, Icon::Star, star_rect, 10.0, palette.secondary);
+        x -= star_width;
     }
     x -= time.size().x;
     ui.painter().galley(
@@ -4108,6 +4198,57 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
     }
     if widgets::menu_item(ui, &palette, Some(Icon::Check), "Select") {
         actions.push(Action::SelectMessage(message.id.clone()));
+    }
+    if !matches!(message.content, Content::Revoked) {
+        let (star_icon, star_label) = if message.starred {
+            (Icon::StarOff, "Unstar")
+        } else {
+            (Icon::Star, "Star")
+        };
+        if widgets::menu_item(ui, &palette, Some(star_icon), star_label) {
+            actions.push(Action::ToggleStarMessage {
+                chat: view.chat.id.clone(),
+                message: message.id.clone(),
+                participant: if view.chat.is_group() && !message.from_me {
+                    Some(message.sender.clone())
+                } else {
+                    None
+                },
+                from_me: message.from_me,
+                starred: !message.starred,
+            });
+        }
+
+        let is_pinned = view
+            .chat
+            .pinned_message
+            .as_ref()
+            .map_or(false, |p| p.message_id == message.id);
+        if is_pinned {
+            if widgets::menu_item(ui, &palette, Some(Icon::PinOff), "Unpin") {
+                actions.push(Action::UnpinMessage {
+                    chat: view.chat.id.clone(),
+                    message_id: message.id.clone(),
+                    from_me: message.from_me,
+                    participant: if view.chat.is_group() && !message.from_me {
+                        Some(message.sender.clone())
+                    } else {
+                        None
+                    },
+                });
+            }
+        } else if widgets::menu_item(ui, &palette, Some(Icon::Pin), "Pin") {
+            actions.push(Action::ShowDialog(Dialog::PinMessage {
+                chat: view.chat.id.clone(),
+                message_id: message.id.clone(),
+                from_me: message.from_me,
+                participant: if view.chat.is_group() && !message.from_me {
+                    Some(message.sender.clone())
+                } else {
+                    None
+                },
+            }));
+        }
     }
     let text = match &message.content {
         Content::Text { text, .. } | Content::Interactive { text, .. } => Some(text.clone()),
@@ -5082,6 +5223,7 @@ fn carousel_row(message: &Message, index: usize, card: &crate::model::Interactiv
         mentions: message.mentions.clone(),
         forwarded: false,
         thumbnail: None,
+        starred: message.starred,
     }
 }
 
@@ -7404,6 +7546,7 @@ mod tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            starred: false,
         };
         let mut widths = Vec::new();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -7516,6 +7659,7 @@ mod reaction_tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            starred: false,
         }
     }
 

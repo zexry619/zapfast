@@ -595,6 +595,14 @@ pub struct App {
     pub post_story_color_idx: usize,
     pub post_story_font_idx: usize,
     pub post_story_media_path: Option<PathBuf>,
+    /// Blocked contact JIDs.
+    pub blocked_contacts: std::collections::HashSet<String>,
+    /// Recent call log entries.
+    pub call_logs: Vec<crate::model::CallLogEntry>,
+    /// Starred messages for dialog.
+    pub starred_messages: Vec<Message>,
+    /// Filter for starred messages dialog (None = all chats).
+    pub starred_filter_chat: Option<ChatId>,
     /// Whether the full call screen is put aside so a chat can be read while the call runs. The call
     /// itself is untouched; the surface is what moves, and a bar offers the way back.
     pub call_surface_hidden: bool,
@@ -1166,6 +1174,10 @@ impl App {
             post_story_color_idx: 0,
             post_story_font_idx: 0,
             post_story_media_path: None,
+            blocked_contacts: std::collections::HashSet::new(),
+            call_logs: Vec::new(),
+            starred_messages: Vec::new(),
+            starred_filter_chat: None,
             call_surface_hidden: false,
             call_fullscreen: false,
             call_notified: None,
@@ -3131,6 +3143,63 @@ impl App {
                 self.sticker_import_pending = false;
                 self.new_contact_pending = false;
                 self.toast_error(message);
+            }
+            Event::StarredMessages { chat, messages } => {
+                self.starred_filter_chat = chat;
+                self.starred_messages = messages;
+            }
+            Event::MessageStarred { chat, id, starred } => {
+                if let Some(convo) = self.conversations.get_mut(&chat) {
+                    if let Some(msg) = convo.messages.iter_mut().find(|m| m.id == id) {
+                        msg.starred = starred;
+                    }
+                }
+                if let Some(msg) = self
+                    .starred_messages
+                    .iter_mut()
+                    .find(|m| m.id == id && m.chat == chat)
+                {
+                    msg.starred = starred;
+                }
+                if !starred {
+                    self.starred_messages.retain(|m| !(m.id == id && m.chat == chat));
+                }
+            }
+            Event::MessagePinned { chat, pinned } => {
+                if let Some(c) = self.chats.iter_mut().find(|c| c.id == chat) {
+                    c.pinned_message = pinned;
+                }
+            }
+            Event::StoryRevoked(id) => {
+                self.stories.remove_story(&id);
+                let stories_file = self.dirs.state.join("stories.json");
+                self.stories.save(&stories_file);
+            }
+            Event::Blocklist(jids) => {
+                self.blocked_contacts = jids.into_iter().collect();
+            }
+            Event::ContactBlocked { jid, blocked } => {
+                let name = self
+                    .chats
+                    .iter()
+                    .find(|c| c.id == jid)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| jid.clone());
+                if blocked {
+                    self.blocked_contacts.insert(jid);
+                    self.toast(format!("Blocked {name}"));
+                } else {
+                    self.blocked_contacts.remove(&jid);
+                    self.toast(format!("Unblocked {name}"));
+                }
+            }
+            Event::CallLogs(logs) => {
+                self.call_logs = logs;
+            }
+            Event::ChatEphemeralUpdated { chat, duration_secs } => {
+                if let Some(c) = self.chats.iter_mut().find(|c| c.id == chat) {
+                    c.ephemeral_expiration = duration_secs;
+                }
             }
             Event::AccountRemoved => {}
         }
@@ -6172,6 +6241,77 @@ impl App {
                 }
             }
             Action::RemoveAccount(id) => self.remove_account(id),
+            Action::ToggleStarMessage {
+                chat,
+                message,
+                participant: _,
+                from_me: _,
+                starred,
+            } => {
+                if let Some(convo) = self.conversations.get_mut(&chat) {
+                    if let Some(msg) = convo.messages.iter_mut().find(|m| m.id == message) {
+                        msg.starred = starred;
+                    }
+                }
+                self.backend.send(Command::ToggleStarMessage {
+                    chat,
+                    id: message,
+                    starred,
+                });
+            }
+            Action::PinMessage {
+                chat,
+                message_id,
+                from_me: _,
+                participant: _,
+                duration,
+            } => {
+                self.backend.send(Command::PinMessage {
+                    chat,
+                    id: message_id,
+                    duration_secs: duration,
+                });
+                self.dialog = None;
+            }
+            Action::UnpinMessage {
+                chat,
+                message_id,
+                from_me: _,
+                participant: _,
+            } => {
+                self.backend.send(Command::UnpinMessage {
+                    chat,
+                    id: message_id,
+                });
+            }
+            Action::RevokeStory(id) => {
+                self.backend.send(Command::RevokeStory(id.clone()));
+                self.stories.remove_story(&id);
+                let stories_file = self.dirs.state.join("stories.json");
+                self.stories.save(&stories_file);
+                self.story_viewer = None;
+                self.toast("Status deleted");
+            }
+            Action::BlockContact(jid) => {
+                self.backend.send(Command::BlockContact(jid));
+            }
+            Action::UnblockContact(jid) => {
+                self.backend.send(Command::UnblockContact(jid));
+            }
+            Action::SetChatEphemeral { chat, duration } => {
+                self.backend.send(Command::SetChatEphemeral {
+                    chat,
+                    duration_secs: duration,
+                });
+                self.dialog = None;
+            }
+            Action::FetchCallLogs => {
+                self.backend.send(Command::FetchCallLogs);
+            }
+            Action::FetchStarredMessages(chat) => {
+                self.starred_filter_chat = chat.clone();
+                self.backend.send(Command::FetchStarredMessages { chat });
+            }
         }
     }
 
@@ -9872,6 +10012,7 @@ mod tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            starred: false,
         }
     }
 
@@ -12432,6 +12573,7 @@ mod name_tests {
             }],
             forwarded: false,
             thumbnail: None,
+            starred: false,
         };
         assert_eq!(app.message_text(&message), "ciao @Carmine");
 
@@ -12542,6 +12684,7 @@ mod app_lock_tests {
             mentions: Vec::new(),
             forwarded: false,
             thumbnail: None,
+            starred: false,
         }
     }
 
