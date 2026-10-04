@@ -2326,6 +2326,13 @@ impl Worker {
                     self.online_sent = None;
                     self.announce_presence(self.online_wanted);
                     spawn_pin_limit_check(client.clone(), self.events.clone(), self.waker.clone());
+                    let regular_client = client.clone();
+                    tokio::spawn(async move {
+                        use whatsapp_rust::{AppStateResyncMode, WAPatchName};
+                        let _ = regular_client
+                            .resync_app_state([WAPatchName::Regular], AppStateResyncMode::Snapshot)
+                            .await;
+                    });
                     let channels = self.commands.clone();
                     let followed = client.clone();
                     tokio::spawn(async move {
@@ -2655,6 +2662,7 @@ impl Worker {
                         .participants
                         .first()
                         .and_then(|p| p.user_jid.clone())
+                        .or_else(|| sync.record.group_jid.clone())
                         .unwrap_or_else(|| sync.call_creator_jid.to_string())
                 } else {
                     sync.call_creator_jid.to_string()
@@ -2676,6 +2684,56 @@ impl Worker {
                     timestamp: sync.record.start_time.unwrap_or_else(|| sync.timestamp.timestamp()),
                     duration: sync.record.duration.unwrap_or(0).max(0) as i64,
                     is_video: sync.record.is_video.unwrap_or(false),
+                    status,
+                };
+                let _ = self.archive.insert_call_log(&entry);
+                self.emit_call_logs();
+            }
+            E::CallLogHistory(history) => {
+                let from_me = history.from_me.unwrap_or(false);
+                let peer = if from_me {
+                    history
+                        .record
+                        .participants
+                        .first()
+                        .and_then(|p| p.user_jid.clone())
+                        .or_else(|| history.record.group_jid.clone())
+                        .or_else(|| history.call_creator_jid.as_ref().map(|j| j.to_string()))
+                        .unwrap_or_default()
+                } else {
+                    history
+                        .call_creator_jid
+                        .as_ref()
+                        .map(|j| j.to_string())
+                        .or_else(|| history.record.call_creator_jid.clone())
+                        .unwrap_or_default()
+                };
+                let canonical_peer = self.canonical_str(&peer);
+                let status = match history.record.call_result {
+                    Some(wa::call_log_record::CallResult::Connected) => CallLogStatus::Connected,
+                    Some(wa::call_log_record::CallResult::Missed) => CallLogStatus::Missed,
+                    Some(wa::call_log_record::CallResult::Rejected) => CallLogStatus::Rejected,
+                    Some(wa::call_log_record::CallResult::Cancelled) => CallLogStatus::Cancelled,
+                    Some(wa::call_log_record::CallResult::Failed) => CallLogStatus::Failed,
+                    _ => CallLogStatus::Other,
+                };
+                let call_id = history
+                    .record
+                    .call_id
+                    .clone()
+                    .unwrap_or_else(|| format!("hist_{}", history.record.start_time.unwrap_or(0)));
+                let entry = CallLogEntry {
+                    call_id,
+                    peer: canonical_peer,
+                    peer_name: None,
+                    from_me,
+                    timestamp: history
+                        .record
+                        .start_time
+                        .or_else(|| history.timestamp.map(|t| t.timestamp()))
+                        .unwrap_or(0),
+                    duration: history.record.duration.unwrap_or(0).max(0) as i64,
+                    is_video: history.record.is_video.unwrap_or(false),
                     status,
                 };
                 let _ = self.archive.insert_call_log(&entry);
@@ -6597,6 +6655,14 @@ impl Worker {
             }
             Command::FetchCallLogs => {
                 self.emit_call_logs();
+                if let Some(client) = self.client.clone() {
+                    tokio::spawn(async move {
+                        use whatsapp_rust::{AppStateResyncMode, WAPatchName};
+                        let _ = client
+                            .resync_app_state([WAPatchName::Regular], AppStateResyncMode::Snapshot)
+                            .await;
+                    });
+                }
             }
         }
     }
