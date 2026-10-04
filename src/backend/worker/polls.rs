@@ -382,7 +382,7 @@ impl Worker {
                     .pn()
                     .ok_or("Not connected to WhatsApp")?
                     .to_non_ad_string();
-                let (sent, secret) = client
+                let created = client
                     .polls()
                     .create(
                         jid,
@@ -392,9 +392,10 @@ impl Worker {
                     )
                     .await
                     .map_err(|_| "Could not send the poll. Please try again.")?;
+                let (sent, _poll_creator, secret) = created.into_parts();
                 Ok(super::super::CreatedPoll {
-                    id: sent.message_id,
-                    secret,
+                    id: sent.message_id.to_string(),
+                    secret: secret.as_bytes().to_vec(),
                     creator,
                     recipients,
                 })
@@ -526,9 +527,9 @@ impl Worker {
             let at = jiff::Timestamp::now().as_millisecond();
             let result = client
                 .polls()
-                .vote(jid, &id, &creator, &secret, &names)
+                .vote_raw(jid, &id, &creator, &secret, &names)
                 .await
-                .map(|sent| sent.message_id)
+                .map(|sent| sent.message_id.to_string())
                 .map_err(|_| "Could not send your vote. Please try again.".into());
             let _ = commands.send(Command::PollVoted {
                 chat,
@@ -1028,7 +1029,7 @@ mod tests {
         let session_path = directory.path().join("session.db");
         let bot = Bot::builder()
             .with_backend(
-                whatsapp_rust::store::SqliteStore::new(session_path.to_str().unwrap())
+                whatsapp_rust::store::SqliteStore::open(session_path.to_str().unwrap())
                     .await
                     .unwrap(),
             )

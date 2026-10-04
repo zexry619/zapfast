@@ -5496,7 +5496,7 @@ impl Worker {
                             subject: group.subject.unwrap_or_default(),
                             description: group.description.filter(|text| !text.trim().is_empty()),
                             members: group
-                                .size
+                                .participant_count
                                 .map_or(group.participants.len(), |size| size as usize),
                             approval: group.membership_approval,
                         })
@@ -7838,7 +7838,7 @@ impl Worker {
         let connected = self
             .client
             .as_ref()
-            .is_some_and(|client| client.is_connected());
+            .is_some_and(|client| client.is_session_ready());
         let Some(client) = self.client.clone().filter(|_| connected) else {
             // Defer profile-picture lookup until connected.
             self.pending_avatars.entry((id, full)).or_insert(0);
@@ -7851,12 +7851,24 @@ impl Worker {
                 let mut failed = false;
                 'lookup: for jid in &candidates {
                     for preview in [!full, false] {
-                        match client.contacts().get_profile_picture(jid, preview).await {
-                            Ok(Some(found)) => {
-                                picture = Some(found);
-                                break 'lookup;
+                        let target = if jid.is_group() {
+                            whatsapp_rust::ProfilePictureTarget::Group(jid)
+                        } else {
+                            whatsapp_rust::ProfilePictureTarget::Contact(jid)
+                        };
+                        let picture_type = if preview {
+                            whatsapp_rust::ProfilePictureType::Preview
+                        } else {
+                            whatsapp_rust::ProfilePictureType::Full
+                        };
+                        let req = whatsapp_rust::ProfilePictureRequest::new(target, picture_type);
+                        match client.contacts().lookup_picture(req).await {
+                            Ok(lookup) => {
+                                if let Some(found) = lookup.into_found() {
+                                    picture = Some(found);
+                                    break 'lookup;
+                                }
                             }
-                            Ok(None) => {}
                             Err(error) => {
                                 log::debug!("picture lookup failed: {error}");
                                 failed = true;
@@ -7891,7 +7903,7 @@ impl Worker {
         if !self
             .client
             .as_ref()
-            .is_some_and(|client| client.is_connected())
+            .is_some_and(|client| client.is_session_ready())
         {
             return;
         }
@@ -8066,7 +8078,10 @@ impl Worker {
         self.apply_ephemeral(&chat, &mut message);
         let commands = self.commands.clone();
         tokio::spawn(async move {
-            if let Err(error) = client.edit_message(jid, id.clone(), message).await {
+            if let Err(error) = client
+                .edit_message_raw(jid, id.clone(), message, whatsapp_rust::EditOptions::default())
+                .await
+            {
                 let _ = commands.send(Command::Sent {
                     chat,
                     id: String::new(),
@@ -8546,12 +8561,14 @@ async fn send_outgoing(
                 return Err("Could not save the group message recipients".to_owned());
             }
         }
-        let mut options = SendOptions::default().with_message_id(id.clone());
+        let message_id = whatsapp_rust::MessageId::new(&id).map_err(|e| e.to_string())?;
+        let mut options = SendOptions::default().with_message_id(message_id);
         if let Some(expiration) = ephemeral_expiration {
             options = options.with_ephemeral_expiration(expiration);
         }
+        let request = whatsapp_rust::SendRequest::new(&jid, message).with_options(options);
         client
-            .send_message_with_options(jid, message, options)
+            .send(request)
             .await
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -14730,7 +14747,7 @@ mod chat_removal_tests {
     #[tokio::test]
     async fn deletion_resolves_a_mapping_known_only_to_the_protocol_library() {
         let directory = tempfile::tempdir().unwrap();
-        let store = whatsapp_rust::store::SqliteStore::new(
+        let store = whatsapp_rust::store::SqliteStore::open(
             &directory.path().join("fixture.db").to_string_lossy(),
         )
         .await
