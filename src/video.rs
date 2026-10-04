@@ -508,6 +508,13 @@ impl Player {
         }
     }
 
+    /// Pauses the loaded video if it is playing.
+    pub fn pause(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.pause(Instant::now());
+        }
+    }
+
     /// The file of the loaded video.
     pub fn path(&self) -> Option<&Path> {
         self.session.as_ref().map(|session| session.path.as_path())

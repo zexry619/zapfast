@@ -147,7 +147,9 @@ impl StoriesStore {
         if current_idx + 1 < group.items.len() {
             Some((current_sender.to_owned(), current_idx + 1))
         } else if group_idx + 1 < groups.len() {
-            Some((groups[group_idx + 1].sender.clone(), 0))
+            let next_group = &groups[group_idx + 1];
+            let start_idx = next_group.items.iter().position(|s| !s.viewed).unwrap_or(0);
+            Some((next_group.sender.clone(), start_idx))
         } else {
             None
         }

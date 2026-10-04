@@ -196,9 +196,12 @@ fn my_status_item(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
     }
     if response.clicked() {
         if has_stories {
+            let first_unviewed = my_stories
+                .and_then(|items| items.iter().position(|s| !s.viewed))
+                .unwrap_or(0);
             app.actions.push(Action::OpenStoryViewer {
                 sender: sender_for_viewer,
-                index: 0,
+                index: first_unviewed,
             });
         } else {
             app.actions.push(Action::OpenPostStory);
@@ -273,9 +276,10 @@ fn contact_story_item(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if response.clicked() {
+        let first_unviewed = contact.items.iter().position(|s| !s.viewed).unwrap_or(0);
         app.actions.push(Action::OpenStoryViewer {
             sender: contact.sender.clone(),
-            index: 0,
+            index: first_unviewed,
         });
     }
 
@@ -424,21 +428,6 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
         }
     }
 
-    let mut video_status = None;
-
-    if is_video {
-        if let Some(ref media_path) = current_item.media_path {
-            let path = std::path::Path::new(media_path);
-            if path.exists() {
-                if app.video.message() != Some(&current_item.id) {
-                    app.video.toggle(&current_item.id, path);
-                }
-                app.video.saw(&current_item.id);
-                video_status = app.video.status(&current_item.id);
-            }
-        }
-    }
-
     // Auto-clear reply sent toast feedback after 2.5s
     if state.reply_sent {
         if let Some(sent_at) = state.reply_sent_at {
@@ -453,20 +442,8 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
 
     // Keyboard navigation: disabled while typing a reply
     let typing_reply = !state.reply_text.is_empty() || ctx.egui_wants_keyboard_input();
+    let effective_paused = state.paused || state.is_holding || typing_reply;
 
-    // Pause video while typing reply so it doesn't advance or skip
-    if typing_reply && is_video {
-        if let Some(ref vs) = video_status {
-            if vs.state == crate::video::State::Playing {
-                if let Some(ref media_path) = current_item.media_path {
-                    let path = std::path::Path::new(media_path);
-                    if path.exists() {
-                        app.video.toggle(&current_item.id, path);
-                    }
-                }
-            }
-        }
-    }
     let (esc, left, right, space) = ctx.input(|i| {
         (
             i.key_pressed(egui::Key::Escape),
@@ -489,16 +466,28 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
         return;
     }
     if space {
-        if is_video {
-            if let Some(ref media_path) = current_item.media_path {
-                let path = std::path::Path::new(media_path);
-                if path.exists() {
-                    app.video.toggle(&current_item.id, path);
-                }
-            }
-        }
         if let Some(viewer) = app.story_viewer.as_mut() {
             viewer.paused = !viewer.paused;
+        }
+    }
+
+    let mut video_status = None;
+
+    if is_video {
+        if let Some(ref media_path) = current_item.media_path {
+            let path = std::path::Path::new(media_path);
+            if path.exists() {
+                if app.video.message() != Some(&current_item.id) {
+                    app.video.toggle(&current_item.id, path);
+                }
+                app.video.saw(&current_item.id);
+                if effective_paused {
+                    app.video.pause();
+                } else {
+                    app.video.resume();
+                }
+                video_status = app.video.status(&current_item.id);
+            }
         }
     }
 
@@ -590,18 +579,6 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
                         if let Some(viewer) = app.story_viewer.as_mut() {
                             viewer.is_holding = true;
                         }
-                        if is_video {
-                            if let Some(ref media_path) = current_item.media_path {
-                                let path = std::path::Path::new(media_path);
-                                if path.exists() {
-                                    if let Some(vs) = app.video.status(&current_item.id) {
-                                        if vs.state == crate::video::State::Playing {
-                                            app.video.toggle(&current_item.id, path);
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -613,21 +590,7 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
             viewer.hold_started_at = None;
             viewer.is_holding = false;
 
-            if was_holding {
-                // Release hold: resume video if not permanently paused
-                if !viewer.paused && is_video {
-                    if let Some(ref media_path) = current_item.media_path {
-                        let path = std::path::Path::new(media_path);
-                        if path.exists() {
-                            if let Some(vs) = app.video.status(&current_item.id) {
-                                if vs.state == crate::video::State::Paused {
-                                    app.video.toggle(&current_item.id, path);
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if hold_dur < Duration::from_millis(180) {
+            if !was_holding && hold_dur < Duration::from_millis(180) {
                 // Quick tap inside content area
                 if let Some(pos) = pointer_pos {
                     if card_rect.contains(pos) && !close_rect.contains(pos)
@@ -640,22 +603,12 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
                             app.actions.push(Action::NextStory);
                         } else {
                             viewer.paused = !viewer.paused;
-                            if is_video {
-                                if let Some(ref media_path) = current_item.media_path {
-                                    let path = std::path::Path::new(media_path);
-                                    if path.exists() {
-                                        app.video.toggle(&current_item.id, path);
-                                    }
-                                }
-                            }
                         }
                     }
                 }
             }
         }
     }
-
-    let effective_paused = state.paused || state.is_holding || typing_reply;
 
     // Delta time accumulation for image/text countdown
     let delta = now.saturating_duration_since(state.last_tick);
@@ -1095,22 +1048,19 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
                         ui.scope_builder(
                             egui::UiBuilder::new().max_rect(reply_bar_rect),
                             |ui| {
-                                ui.horizontal(|ui| {
+                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                     ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
                                     ui.add_space(14.0);
 
                                     // Chat icon
+                                    let (icon_rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                                     theme::paint_icon(
                                         ui,
                                         Icon::MessageCircle,
-                                        Rect::from_center_size(
-                                            pos2(reply_bar_rect.left() + 22.0, reply_bar_rect.center().y),
-                                            Vec2::splat(16.0),
-                                        ),
+                                        icon_rect,
                                         16.0,
                                         Color32::from_white_alpha(150),
                                     );
-                                    ui.add_space(16.0);
 
                                     // TextEdit field without nested box border
                                     let mut submit = false;

@@ -3086,6 +3086,7 @@ impl App {
                 self.stories.set_media_path(&id, path);
                 let stories_file = self.dirs.state.join("stories.json");
                 self.stories.save(&stories_file);
+                self.waker.wake();
             }
             Event::UpdateAvailable { version, url } => {
                 let notice = crate::updates::Release { version, url };
@@ -6489,7 +6490,11 @@ impl App {
     /// Shows the playing video's frames, stops it once its chat is left, and
     /// hands a video it cannot decode to the system player.
     fn tick_video(&mut self, ctx: &egui::Context) {
-        if self.story_viewer.is_none() && self.video.message().is_some() && self.video_chat != self.open_chat {
+        if self.story_viewer.is_some() {
+            if let Some(msg) = self.video.message() {
+                self.video.saw(msg);
+            }
+        } else if self.video.message().is_some() && self.video_chat != self.open_chat {
             self.video.stop();
         }
         if self.video_expanded && self.video.message().is_none() {
@@ -7333,7 +7338,7 @@ mod tests {
             .push(crate::notify::NotificationTarget {
                 account: AccountId::parse("2").unwrap(),
                 chat: "15550003333@s.whatsapp.net".into(),
-                message: "m1".into(),
+                message: Some("m1".into()),
             });
         app.handle_notification_opens();
         assert_eq!(
