@@ -70,7 +70,7 @@ impl Status {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Notice {
     /// ZapFast cannot decode this video, so it should open in the system player.
-    Unsupported(PathBuf),
+    Unsupported { message: String, path: PathBuf },
 }
 
 /// What the decoder thread hands to the interface thread.
@@ -351,6 +351,7 @@ pub struct Player {
     /// Longest side frames are decoded to: larger while the video covers
     /// the window.
     side: u32,
+    unsupported: std::collections::HashSet<String>,
 }
 
 impl Player {
@@ -362,7 +363,18 @@ impl Player {
             audible: true,
             seen: Cell::new(Instant::now()),
             side: MAX_SIDE,
+            unsupported: std::collections::HashSet::new(),
         }
+    }
+
+    /// Whether this message's video failed decoding and is unsupported.
+    pub fn is_unsupported(&self, message: &str) -> bool {
+        self.unsupported.contains(message)
+    }
+
+    /// Explicitly mark a message as unsupported.
+    pub fn mark_unsupported(&mut self, message: &str) {
+        self.unsupported.insert(message.to_owned());
     }
 
     /// Plays videos without opening the sound device.
@@ -374,6 +386,9 @@ impl Player {
     /// Plays or pauses a message's video, starting it when another one (or
     /// none) is loaded.
     pub fn toggle(&mut self, message: &str, path: &Path) {
+        if self.unsupported.contains(message) {
+            return;
+        }
         let now = Instant::now();
         match self.session.as_mut() {
             Some(session) if session.message == message && session.path == path => {
@@ -622,8 +637,10 @@ impl Player {
                 Ok(Delivery::Unsupported(reason)) => {
                     log::info!("video opens in the system player: {reason}");
                     let path = session.path.clone();
+                    let message = session.message.clone();
+                    self.unsupported.insert(message.clone());
                     self.session = None;
-                    return Some(Notice::Unsupported(path));
+                    return Some(Notice::Unsupported { message, path });
                 }
                 Err(TryRecvError::Empty) => break,
             }
@@ -638,8 +655,10 @@ impl Player {
             } else if session.decoded {
                 // Not one frame decoded: hand the file to the system player.
                 let path = session.path.clone();
+                let message = session.message.clone();
+                self.unsupported.insert(message.clone());
                 self.session = None;
-                return Some(Notice::Unsupported(path));
+                return Some(Notice::Unsupported { message, path });
             } else {
                 return None;
             }
@@ -1334,7 +1353,13 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(notice, Notice::Unsupported(path));
+        assert_eq!(
+            notice,
+            Notice::Unsupported {
+                message: "clip".into(),
+                path
+            }
+        );
         assert!(player.message().is_none());
     }
 

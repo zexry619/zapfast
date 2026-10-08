@@ -6641,12 +6641,19 @@ impl App {
             self.video_expanded = false;
             self.video.set_expanded(false);
         }
-        if let Some(crate::video::Notice::Unsupported(path)) = self.video.poll(ctx) {
-            self.toast(crate::i18n::gettext(
-                self.locale,
-                "This video opens in your system player",
-            ));
-            self.actions.push(Action::OpenFile(path));
+        if let Some(crate::video::Notice::Unsupported { message: _, path }) = self.video.poll(ctx) {
+            if self.story_viewer.is_some() {
+                self.toast(crate::i18n::gettext(
+                    self.locale,
+                    "Format video status tidak didukung pemutar internal",
+                ));
+            } else {
+                self.toast(crate::i18n::gettext(
+                    self.locale,
+                    "This video opens in your system player",
+                ));
+                self.actions.push(Action::OpenFile(path));
+            }
         }
     }
 

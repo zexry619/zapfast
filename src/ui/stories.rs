@@ -471,9 +471,10 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
         }
     }
 
+    let is_unsupported_video = is_video && app.video.is_unsupported(&current_item.id);
     let mut video_status = None;
 
-    if is_video {
+    if is_video && !is_unsupported_video {
         if let Some(ref media_path) = current_item.media_path {
             let path = std::path::Path::new(media_path);
             if path.exists() {
@@ -492,6 +493,7 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
     }
 
     let is_video_loading = is_video
+        && !is_unsupported_video
         && (video_status.as_ref().map_or(true, |vs| {
             vs.state == crate::video::State::Loading || vs.frame.is_none()
         }));
@@ -517,6 +519,14 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
         pos2(card_rect.right() - 28.0, card_rect.top() + 42.0),
         vec2(32.0, 32.0),
     );
+    let unsupported_btn_rect = if is_unsupported_video {
+        Rect::from_center_size(
+            pos2(card_rect.center().x, card_rect.center().y + 24.0),
+            vec2(220.0, 36.0),
+        )
+    } else {
+        Rect::NOTHING
+    };
 
     let now = Instant::now();
     let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
@@ -526,7 +536,11 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
     // Press and hold (tap and hold) handling
     if pointer_down {
         if let Some(pos) = pointer_pos {
-            if card_rect.contains(pos) && !close_rect.contains(pos) && pos.y <= card_rect.bottom() - 110.0 {
+            if card_rect.contains(pos)
+                && !close_rect.contains(pos)
+                && !unsupported_btn_rect.contains(pos)
+                && pos.y <= card_rect.bottom() - 110.0
+            {
                 if state.hold_started_at.is_none() {
                     if let Some(viewer) = app.story_viewer.as_mut() {
                         viewer.hold_started_at = Some(now);
@@ -550,8 +564,11 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
             if !was_holding && hold_dur < Duration::from_millis(180) {
                 // Quick tap inside content area
                 if let Some(pos) = pointer_pos {
-                    if card_rect.contains(pos) && !close_rect.contains(pos)
-                        && pos.y >= card_rect.top() + 70.0 && pos.y <= card_rect.bottom() - 110.0
+                    if card_rect.contains(pos)
+                        && !close_rect.contains(pos)
+                        && !unsupported_btn_rect.contains(pos)
+                        && pos.y >= card_rect.top() + 70.0
+                        && pos.y <= card_rect.bottom() - 110.0
                     {
                         let rel_x = (pos.x - card_rect.left()) / card_rect.width();
                         if rel_x < 0.25 {
@@ -577,7 +594,7 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
     }
 
     // Progress determination
-    let progress = if is_video {
+    let progress = if is_video && !is_unsupported_video {
         if let Some(ref vs) = video_status {
             if is_video_loading {
                 ctx.request_repaint_after(Duration::from_millis(50));
@@ -681,7 +698,51 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
                     if let Some(thumb_bytes) = &current_item.thumbnail {
                         render_thumbnail(ctx, ui, card_rect, &current_item.id, thumb_bytes);
                     }
-                    if is_video_loading && (current_item.raw_message.is_some() || current_item.media_path.is_some()) {
+                    if is_unsupported_video {
+                        let box_rect = Rect::from_center_size(
+                            pos2(card_rect.center().x, card_rect.center().y),
+                            vec2(300.0, 110.0),
+                        );
+                        ui.painter().rect_filled(box_rect, CornerRadius::same(12), Color32::from_black_alpha(210));
+                        ui.painter().text(
+                            pos2(box_rect.center().x, box_rect.top() + 20.0),
+                            Align2::CENTER_CENTER,
+                            "Format video tidak didukung pemutar internal",
+                            egui::FontId::proportional(12.5),
+                            Color32::WHITE,
+                        );
+                        ui.painter().text(
+                            pos2(box_rect.center().x, box_rect.top() + 38.0),
+                            Align2::CENTER_CENTER,
+                            "(misal: HEVC / H.265)",
+                            egui::FontId::proportional(11.0),
+                            Color32::from_rgb(180, 180, 180),
+                        );
+
+                        if let Some(ref media_path) = current_item.media_path {
+                            let btn_resp = ui.allocate_rect(unsupported_btn_rect, Sense::click());
+                            let btn_hovered = btn_resp.hovered();
+                            let btn_bg = if btn_hovered {
+                                palette.accent
+                            } else {
+                                palette.accent.gamma_multiply(0.85)
+                            };
+                            ui.painter().rect_filled(unsupported_btn_rect, CornerRadius::same(8), btn_bg);
+                            ui.painter().text(
+                                unsupported_btn_rect.center(),
+                                Align2::CENTER_CENTER,
+                                "▶  Buka di Pemutar Eksternal",
+                                egui::FontId::proportional(12.5),
+                                Color32::WHITE,
+                            );
+                            if btn_hovered {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if btn_resp.clicked() {
+                                app.actions.push(Action::OpenFile(std::path::PathBuf::from(media_path)));
+                            }
+                        }
+                    } else if is_video_loading && (current_item.raw_message.is_some() || current_item.media_path.is_some()) {
                         let disc = Rect::from_center_size(card_rect.center(), vec2(48.0, 48.0));
                         theme::paint_spinner(ui, disc, 28.0, Color32::WHITE);
                     } else if current_item.media_path.is_none() && current_item.raw_message.is_none() {
