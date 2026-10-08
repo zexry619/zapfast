@@ -826,9 +826,9 @@ fn tray_config(lockable: bool) -> fastframe_tray::Config {
         title: "ZapFast".into(),
         icon: crate::util::app_icon_rgba,
         template_icon: Some(crate::util::tray_template_rgba),
-        // The tray icon is the app icon, so hosts that draw only named icons
-        // may use the installed one.
-        themed_icon: true,
+        // Use the embedded pixmap directly so desktop environments without
+        // system-installed icon themes (such as COSMIC) reliably render the tray icon.
+        themed_icon: false,
         // A left click on macOS toggles the window, as on Linux.
         menu_on_click: false,
         menu: vec![
