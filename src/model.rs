@@ -335,6 +335,10 @@ pub struct Message {
     pub from_me: bool,
     /// Unix seconds.
     pub timestamp: i64,
+    /// The phone's order within a history conversation, used to break timestamp
+    /// ties. Live messages and older archives may not have one.
+    #[serde(default)]
+    pub history_order: Option<i64>,
     pub content: Content,
     pub status: Delivery,
     /// First delivered-receipt Unix timestamp for outgoing messages.
@@ -1489,6 +1493,10 @@ pub enum Action {
     },
     /// Requests messages older than the local archive, for the reader.
     FetchOlder(ChatId),
+    ReloadHistory {
+        chat: ChatId,
+        message: String,
+    },
     Download {
         card: Option<usize>,
         chat: ChatId,
@@ -1572,6 +1580,8 @@ pub enum Action {
         messages: Vec<String>,
         to_chat: ChatId,
     },
+    /// Starts selecting messages in the open chat with none picked yet.
+    StartSelection,
     /// Starts selecting messages in the open chat, beginning with this one.
     SelectMessage(String),
     /// Adds a message to the selection or removes it.
@@ -1842,6 +1852,8 @@ pub enum Action {
     RemoveGroupPicture(ChatId),
     /// Sets or resets (`None`) the folder for new downloads.
     SetDownloadFolder(Option<PathBuf>),
+    /// Keeps archived chats archived when a new message comes, or not.
+    SetKeepChatsArchived(bool),
     /// Saves the proxy setting and reconnects. Empty follows the environment.
     SetProxy(String),
     /// Plays a notification sound once, as a preview.

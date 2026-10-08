@@ -50,7 +50,10 @@ mod polls;
 mod sticker_pace;
 mod stickers;
 
-use super::{Command, Event, GroupEdit, LinkStatus, Refusal, Unsent, Waker, read_sync::ReadSync};
+use super::{
+    Command, Event, GroupEdit, LinkStatus, MessageRemovalOutcome, Refusal, Unsent, Waker,
+    read_sync::ReadSync,
+};
 use crate::app::PAGE;
 use crate::archive::Archive;
 use crate::model::{
@@ -485,6 +488,7 @@ pub async fn run(
         privacy_warned: false,
         privacy_recovering: false,
         privacy_generation: 0,
+        message_removals_in_flight: HashSet::new(),
         privacy_retry: Instant::now(),
         withheld_pages: Vec::new(),
         dirs,
@@ -518,6 +522,7 @@ pub async fn run(
         group_info_retry: Vec::new(),
         presence_subscribed: HashSet::new(),
         download_folder: None,
+        keep_chats_archived: true,
         online_wanted: false,
         online_changed: Instant::now(),
         online_sent: None,
@@ -580,6 +585,9 @@ pub async fn run(
             }
             Some(event) = wa_events.recv() => match event {
                 RuntimeEvent::WhatsApp(event) => worker.handle_wa_event(event).await,
+                RuntimeEvent::MessageRemoval { generation, event } => {
+                    worker.handle_session_deletion(generation, event).await;
+                }
                 RuntimeEvent::PreferencesRecovered {
                     generation,
                     locks,
@@ -637,6 +645,10 @@ pub async fn run(
 
 enum RuntimeEvent {
     WhatsApp(Arc<wa_events::Event>),
+    MessageRemoval {
+        generation: u64,
+        event: Arc<wa_events::Event>,
+    },
     PreferencesRecovered {
         generation: u64,
         locks: bool,
@@ -715,11 +727,25 @@ fn privacy_backoff(attempts: u32) -> Duration {
         .min(Duration::from_secs(15 * 60))
 }
 
-struct UiEvents(mpsc::UnboundedSender<RuntimeEvent>);
+struct UiEvents {
+    sender: mpsc::UnboundedSender<RuntimeEvent>,
+    generation: u64,
+}
 
 impl wa_events::EventHandler for UiEvents {
     fn handle_event(&self, event: Arc<wa_events::Event>) {
-        let _ = self.0.send(RuntimeEvent::WhatsApp(event));
+        let event = if matches!(
+            event.as_ref(),
+            wa_events::Event::DeleteMessageForMeUpdate(_)
+        ) {
+            RuntimeEvent::MessageRemoval {
+                generation: self.generation,
+                event,
+            }
+        } else {
+            RuntimeEvent::WhatsApp(event)
+        };
+        let _ = self.sender.send(event);
     }
 }
 
@@ -731,6 +757,16 @@ enum WithheldPage {
     Page(ChatId, Option<super::PageKey>),
     /// `Command::LoadUntil`.
     Until(ChatId, String, super::PageKey),
+}
+
+/// A failed attempt cannot settle any earlier attempt whose reply was lost.
+fn message_removal_outcome(
+    result: Result<(), whatsapp_rust::AppStateError>,
+) -> MessageRemovalOutcome {
+    match result {
+        Ok(()) => MessageRemovalOutcome::Accepted,
+        Err(_) => MessageRemovalOutcome::Uncertain,
+    }
 }
 
 struct Worker {
@@ -746,6 +782,8 @@ struct Worker {
     privacy_warned: bool,
     privacy_recovering: bool,
     privacy_generation: u64,
+    /// Serializes requests for one message, including across privacy-id mapping.
+    message_removals_in_flight: HashSet<(ChatId, String)>,
     privacy_retry: Instant,
     /// Transcript pages asked for while private content was withheld. Their
     /// answers never reached the interface, which still waits for them, so
@@ -806,6 +844,9 @@ struct Worker {
     presence_subscribed: HashSet<String>,
     /// Chosen folder for new downloads, when not the cache.
     download_folder: Option<PathBuf>,
+    /// Settings' "Keep chats archived". Off, a new message unarchives its
+    /// chat here, as the phone does; WhatsApp sends no mutation for it.
+    keep_chats_archived: bool,
     /// Whether the window is focused and visible.
     online_wanted: bool,
     /// When `online_wanted` last changed.
@@ -937,6 +978,7 @@ struct OlderRequest {
 }
 
 struct ParsedChat {
+    diagnostics: HistoryDiagnostics,
     id: String,
     name: Option<String>,
     unread: Option<u32>,
@@ -960,6 +1002,27 @@ struct ParsedChat {
     revoked: Vec<String>,
     poll_updates: Vec<HistoryPollUpdate>,
     reactions: Vec<HistoryReaction>,
+}
+
+/// Counts only. Never put message keys, bodies, names, or raw protobufs here:
+/// this summary is safe to request from a user's ordinary application log.
+#[derive(Debug, Default)]
+struct HistoryDiagnostics {
+    entries: usize,
+    missing_envelope: usize,
+    missing_key: usize,
+    missing_body: usize,
+    ciphertext_stubs: usize,
+    futureproof_body: usize,
+    edited_wrappers: usize,
+    edit_snapshots: usize,
+    rekeyed_edit_snapshots: usize,
+    invalid_edits: usize,
+    edit_without_key: usize,
+    edit_without_body: usize,
+    encrypted_edits: usize,
+    other_protocol: usize,
+    unclassified: usize,
 }
 
 struct HistoryPollUpdate {
@@ -991,6 +1054,8 @@ struct ParsedMessage {
     from_me: bool,
     push_name: Option<String>,
     timestamp: i64,
+    history_order: Option<i64>,
+    edited: bool,
     content: Content,
     status: Delivery,
     quoted: Option<Quoted>,
@@ -1170,6 +1235,17 @@ impl Worker {
             .is_some_and(|through| timestamp <= through)
     }
 
+    /// Blocks a deleted message's replay, failing closed if the barrier cannot be read.
+    fn message_was_removed(&self, chat: &str, id: &str) -> bool {
+        match self.archive.message_removed(chat, id) {
+            Ok(removed) => removed,
+            Err(_) => {
+                log::warn!("could not check a message's deletion state");
+                true
+            }
+        }
+    }
+
     fn emit_chats(&self) {
         match self.archive.chats() {
             Ok(mut chats) => {
@@ -1330,6 +1406,7 @@ impl Worker {
                 .map(|contact| (contact.id.clone(), contact))
                 .collect();
         }
+        self.retry_confirmed_message_removals();
         if self.me_pn.is_some() || self.me_lid.is_some() {
             self.emit(self.me_event());
         }
@@ -1595,7 +1672,10 @@ impl Worker {
                     .with_version(app_version())
                     .with_platform_type(wa::device_props::PlatformType::DESKTOP),
             )
-            .with_event_handler(UiEvents(sender))
+            .with_event_handler(UiEvents {
+                sender,
+                generation: self.privacy_generation,
+            })
             .build()
             .await;
         match bot {
@@ -1852,22 +1932,37 @@ impl Worker {
         if self.lid_to_pn.get(lid).is_some_and(|known| known == pn) {
             return;
         }
+        let changed = match self.archive.put_lid(lid, pn) {
+            Ok(changed) => changed,
+            Err(error) => {
+                log::warn!("could not remember an id mapping: {error}");
+                return;
+            }
+        };
         self.lid_to_pn.insert(lid.to_owned(), pn.to_owned());
-        match self.archive.put_lid(lid, pn) {
-            Ok(changed) => {
-                if changed {
-                    self.emit_chats();
+        if changed {
+            self.emit_chats();
+        }
+        let chat = format!("{pn}@s.whatsapp.net");
+        let lid_chat = format!("{lid}@lid");
+        match self.archive.removed_message_ids(&chat) {
+            Ok(ids) => {
+                for id in ids {
+                    for alias in [&chat, &lid_chat] {
+                        self.emit(Event::MessageDeleted {
+                            chat: alias.clone(),
+                            id: id.clone(),
+                        });
+                    }
                 }
             }
-            Err(error) => log::warn!("could not remember an id mapping: {error}"),
+            Err(_) => self.emit(Event::Error("Could not refresh deleted messages".into())),
         }
         // Receipts filed under the privacy id may name messages archived
         // under the phone number.
-        let chat = format!("{pn}@s.whatsapp.net");
         for id in self.archive.waiting_receipts(&chat).unwrap_or_default() {
             self.settle_early_receipts(&chat, &id);
         }
-        let lid_chat = format!("{lid}@lid");
         let mapped = self.canonical_str(&lid_chat);
         for id in self.early.rekey(&lid_chat, &mapped) {
             if matches!(self.archive.message(&mapped, &id), Ok(Some(_))) {
@@ -2254,6 +2349,13 @@ impl Worker {
 
     // --- WhatsApp events -------------------------------------------------
 
+    /// The callback owns its original generation, even if it runs after logout.
+    async fn handle_session_deletion(&mut self, generation: u64, event: Arc<wa_events::Event>) {
+        if generation == self.privacy_generation {
+            self.handle_wa_event(event).await;
+        }
+    }
+
     async fn handle_wa_event(&mut self, event: Arc<wa_events::Event>) {
         use wa_events::Event as E;
         match &*event {
@@ -2307,6 +2409,7 @@ impl Worker {
                 };
                 self.remember_identity(pn, lid, name);
                 self.set_status(LinkStatus::Connected);
+                self.retry_message_removals();
                 // A new connection may reach a phone that was away before.
                 self.older_warned.clear();
                 self.refresh_legacy_preferences();
@@ -2583,6 +2686,10 @@ impl Worker {
                 );
                 let _ = self.empty_chat(&chat, through, update.delete_media);
             }
+            E::DeleteMessageForMeUpdate(update) => {
+                self.canonical_sync_chat(&update.chat_jid).await;
+                self.delete_message_here(&update.chat_jid.to_string(), &update.message_id);
+            }
             E::MarkChatAsReadUpdate(update) => {
                 let chat = self.canonical(&update.jid);
                 self.ensure_chat(&chat, None);
@@ -2814,6 +2921,7 @@ impl Worker {
 
     async fn on_logged_out(&mut self) {
         self.privacy_generation = self.privacy_generation.wrapping_add(1);
+        self.message_removals_in_flight.clear();
         self.stop_bot().await;
         if let Err(error) = self.archive.clear() {
             log::warn!("could not clear the archive: {error}");
@@ -3616,6 +3724,7 @@ impl Worker {
             read_at: None,
             quoted,
             reactions: Vec::new(),
+            history_order: None,
             edited: false,
             mentions,
             forwarded: forwarded_of(base),
@@ -4053,6 +4162,7 @@ impl Worker {
             read_at: None,
             quoted: None,
             reactions: Vec::new(),
+            history_order: None,
             edited: false,
             mentions: Vec::new(),
             forwarded: false,
@@ -4082,7 +4192,9 @@ impl Worker {
         push_name: Option<&str>,
         poll_baseline: bool,
     ) {
-        if self.predates_removal(&message.chat, message.timestamp) {
+        if self.predates_removal(&message.chat, message.timestamp)
+            || self.message_was_removed(&message.chat, &message.id)
+        {
             return;
         }
         let chat = message.chat.clone();
@@ -4109,6 +4221,17 @@ impl Worker {
         }
         if poll_baseline && let Err(error) = self.archive.mark_poll_history(&chat, &message.id) {
             log::warn!("could not store a live poll baseline: {error}");
+        }
+        // History is filed elsewhere, so this is a live message, ours or
+        // theirs. A duplicate delivery or one older than the archiving does
+        // not bring the chat back.
+        if is_new
+            && !self.keep_chats_archived
+            && let Err(error) = self
+                .archive
+                .unarchive_for_message(&chat, message.timestamp.saturating_mul(1000))
+        {
+            log::warn!("could not unarchive a chat: {error}");
         }
         // The phone may have read it, and reacted, before it reached us.
         let read_on_phone = self.settle_early_events(&chat, &message.id);
@@ -4297,6 +4420,16 @@ impl Worker {
                             .map(|chat| chat.poll_updates.len())
                             .sum::<usize>()
                     );
+                    for chat in &parsed.chats {
+                        log::info!(
+                            "history reload: parsed entries={}, visible={}, reactions={}, votes={}, counts={:?}",
+                            chat.diagnostics.entries,
+                            chat.messages.len(),
+                            chat.reactions.len(),
+                            chat.poll_updates.len(),
+                            chat.diagnostics,
+                        );
+                    }
                 }
                 let filed = self.apply_history(parsed, !on_demand);
                 if on_demand {
@@ -4458,8 +4591,16 @@ impl Worker {
                 self.request_group_info(&id, false);
             }
             let count = chat.messages.len();
+            let mut added = 0;
+            let mut repeated = 0;
+            let mut removed = 0;
+            let mut failed = 0;
             let mut secrets = HashMap::new();
             for message in chat.messages {
+                if self.message_was_removed(&id, &message.id) {
+                    removed += 1;
+                    continue;
+                }
                 if let Some(secret) = message
                     .poll_secret
                     .as_deref()
@@ -4513,8 +4654,15 @@ impl Worker {
                 // A direct chat's receipt times date its ticks. A group's may
                 // be partial, so they only fill in "Message info".
                 let group = ChatKind::from_id(&id) == ChatKind::Group;
+                // A zero timestamp means the time is unknown: kept, it would
+                // win `min()` and date the tick to the Unix epoch.
                 let first = |at: fn(&wa::UserReceipt) -> Option<i64>| {
-                    message.receipts.iter().filter_map(at).min()
+                    message
+                        .receipts
+                        .iter()
+                        .filter_map(at)
+                        .filter(|&at| at > 0)
+                        .min()
                 };
                 let read = matches!(message.status, Delivery::Read | Delivery::Played);
                 let delivered_at = first(|receipt| receipt.receipt_timestamp)
@@ -4537,7 +4685,8 @@ impl Worker {
                     read_at,
                     quoted,
                     reactions,
-                    edited: false,
+                    history_order: message.history_order,
+                    edited: message.edited,
                     mentions,
                     forwarded: message.forwarded,
                     thumbnail: message.thumbnail,
@@ -4559,11 +4708,33 @@ impl Worker {
                 }
                 // History replays and on-demand chunks can repeat a message the
                 // archive already holds; keep the files it already downloaded.
+                let mut keep_raw = false;
+                let mut existed = false;
                 if let Ok(Some(existing)) = self.archive.message(&id, &row.id) {
+                    existed = true;
                     row.content.keep_local_paths(&existing.content);
+                    // A repeated original must not undo a later edit or revoke.
+                    if (existing.edited && !row.edited)
+                        || matches!(existing.content, Content::Revoked)
+                    {
+                        row.content = existing.content;
+                        row.edited = existing.edited;
+                        row.quoted = existing.quoted;
+                        row.mentions = existing.mentions;
+                        row.thumbnail = existing.thumbnail;
+                        keep_raw = true;
+                    }
                 }
-                if let Err(error) = self.archive.insert_message(&row, Some(&raw)) {
+                if let Err(error) = self
+                    .archive
+                    .insert_message(&row, (!keep_raw).then_some(raw.as_slice()))
+                {
+                    failed += 1;
                     log::warn!("could not store a history message: {error}");
+                } else if existed {
+                    repeated += 1;
+                } else {
+                    added += 1;
                 }
                 self.settle_early_events(&id, &row.id);
                 if group {
@@ -4576,6 +4747,11 @@ impl Worker {
                     }
                     self.emit_message(&id, &row.id);
                 }
+            }
+            if !metadata && self.pending_older.contains_key(&id) {
+                log::info!(
+                    "history reload: archived added={added}, repeated={repeated}, removed={removed}, failed={failed}"
+                );
             }
             for reaction in chat.reactions {
                 self.apply_history_reaction(&id, reaction, &secrets);
@@ -4658,6 +4834,7 @@ impl Worker {
                 .messages(&chat, Some((before_time, &before_id)), 500)
             {
                 Ok(mut messages) => {
+                    log::info!("history reload: displaying rows={}", messages.len());
                     for message in &mut messages {
                         self.polish(message);
                     }
@@ -4714,15 +4891,43 @@ impl Worker {
             self.emit(Event::OlderFetched { chat, more: false });
             return;
         }
-        let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&chat)) else {
-            // Offline requests retry after reconnection; the banner shows state.
-            self.emit(Event::OlderFetched { chat, more: true });
-            return;
-        };
         // Chats without messages request history from the current time.
         let (id, from_me, timestamp) = match self.archive.oldest(&chat) {
             Ok(Some(oldest)) => (oldest.id, oldest.from_me, oldest.timestamp),
             _ => (String::new(), false, crate::util::now()),
+        };
+        self.request_history(chat, id, from_me, timestamp, explicit);
+    }
+
+    fn reload_history(&mut self, chat: ChatId, message: String) {
+        if self.pending_older.contains_key(&chat) {
+            return;
+        }
+        let Ok(Some(anchor)) = self.archive.message(&chat, &message) else {
+            self.emit(Event::OlderFetched { chat, more: true });
+            self.emit(Event::Error(
+                "This message is no longer in the archive".into(),
+            ));
+            return;
+        };
+        // This repairs gaps inside existing history, even when the phone has
+        // already told us there is nothing before the start of the chat.
+        self.older_warned.remove(&chat);
+        self.request_history(chat, anchor.id, anchor.from_me, anchor.timestamp, true);
+    }
+
+    fn request_history(
+        &mut self,
+        chat: ChatId,
+        id: String,
+        from_me: bool,
+        timestamp: i64,
+        explicit: bool,
+    ) {
+        let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&chat)) else {
+            // Offline requests retry after reconnection; the banner shows state.
+            self.emit(Event::OlderFetched { chat, more: true });
+            return;
         };
         self.pending_older.insert(
             chat.clone(),
@@ -4931,6 +5136,7 @@ impl Worker {
             }
             Command::LoadChat { chat, before } => self.load_chat(chat, before),
             Command::FetchOlder { chat, explicit } => self.fetch_older(chat, explicit),
+            Command::ReloadHistory { chat, message } => self.reload_history(chat, message),
             Command::LoadUntil { chat, id, before } => self.load_until(chat, id, before),
             Command::SearchMessages { query } => self.search_messages(query),
             Command::SearchChatMessages {
@@ -4971,12 +5177,25 @@ impl Worker {
             } => self.edit_text(chat, id, text, mentions),
             Command::Revoke { chat, id } => self.revoke(chat, id),
             Command::DeleteLocal { chat, id } => {
-                if let Ok(true) = self.archive.delete_message(&chat, &id) {
-                    self.emit(Event::MessageDeleted {
-                        chat: chat.clone(),
-                        id,
-                    });
-                    self.emit_chat(&chat);
+                self.delete_message_for_me(chat, id);
+            }
+            Command::MessageDeletedForMe {
+                generation,
+                chat,
+                id,
+                outcome,
+            } => {
+                if generation != self.privacy_generation {
+                    return;
+                }
+                self.message_removals_in_flight
+                    .remove(&(chat.clone(), id.clone()));
+                match outcome {
+                    MessageRemovalOutcome::Accepted => self.delete_message_here(&chat, &id),
+                    MessageRemovalOutcome::Uncertain => self.emit(Event::Error(
+                        "Could not confirm the deletion. It will be retried after reconnecting"
+                            .into(),
+                    )),
                 }
             }
             Command::PickFiles(chat) => {
@@ -5049,6 +5268,7 @@ impl Worker {
                 }
                 self.download_folder = folder;
             }
+            Command::SetKeepChatsArchived(keep) => self.keep_chats_archived = keep,
             Command::SetChatSound { chat, sound } => {
                 let _ = self.archive.set_notification_sound(&chat, sound.as_ref());
                 self.emit_chat(&chat);
@@ -6792,6 +7012,7 @@ impl Worker {
             sender_name: None,
             from_me: true,
             timestamp: crate::util::now(),
+            history_order: None,
             content: Content::text(text),
             status: Delivery::Pending,
             delivered_at: None,
@@ -7163,6 +7384,7 @@ impl Worker {
             read_at: None,
             quoted: shown,
             reactions: Vec::new(),
+            history_order: None,
             edited: false,
             mentions,
             forwarded: false,
@@ -8155,6 +8377,187 @@ impl Worker {
                 });
             }
         });
+    }
+
+    /// Sends the account deletion through whatsapp-rust before removing our copy.
+    fn delete_message_for_me(&mut self, chat: ChatId, id: String) {
+        if self.message_removal_in_flight(&chat, &id) {
+            return;
+        }
+        match self.archive.message_removed(&chat, &id) {
+            Ok(true) => {
+                self.delete_message_here(&chat, &id);
+                return;
+            }
+            Ok(false) => {}
+            Err(_) => {
+                self.emit(Event::Error(
+                    "Could not read the message's deletion state".into(),
+                ));
+                return;
+            }
+        }
+        let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&chat)) else {
+            self.emit(Event::Error(
+                "Connect to WhatsApp to delete this message".to_owned(),
+            ));
+            return;
+        };
+        let message = match self.archive.message(&chat, &id) {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                if self.archive.cancel_message_removal(&chat, &id).is_err() {
+                    self.emit(Event::Error("Could not clear the pending deletion".into()));
+                }
+                return;
+            }
+            Err(_) => {
+                self.emit(Event::Error(
+                    "Could not read the message to delete".to_owned(),
+                ));
+                return;
+            }
+        };
+        let participant = if jid.is_group() && !message.from_me {
+            let Some(sender) = Self::jid_of(&message.sender) else {
+                self.emit(Event::Error(
+                    "Could not identify the message to delete".to_owned(),
+                ));
+                return;
+            };
+            Some(sender)
+        } else {
+            None
+        };
+        let Some(account) = self.me_pn.as_deref() else {
+            self.emit(Event::Error(
+                "Could not identify the account for this deletion".into(),
+            ));
+            return;
+        };
+        if self
+            .archive
+            .queue_message_removal(account, &chat, &id)
+            .is_err()
+        {
+            self.emit(Event::Error("Could not save the pending deletion".into()));
+            return;
+        }
+        let generation = self.privacy_generation;
+        self.message_removals_in_flight
+            .insert((chat.clone(), id.clone()));
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let result = client
+                .chat_actions()
+                .delete_message_for_me(
+                    &jid,
+                    participant.as_ref(),
+                    &id,
+                    message.from_me,
+                    true,
+                    Some(message.timestamp),
+                )
+                .await;
+            let outcome = message_removal_outcome(result);
+            let _ = commands.send(Command::MessageDeletedForMe {
+                generation,
+                chat,
+                id,
+                outcome,
+            });
+        });
+    }
+
+    /// Retries interrupted deletions after reconnect without relying on redelivery.
+    fn retry_message_removals(&mut self) {
+        self.retry_confirmed_message_removals();
+        let Some(account) = self.me_pn.as_deref() else {
+            return;
+        };
+        match self.archive.pending_message_removals(account) {
+            Ok(pending) => {
+                for (chat, id) in pending {
+                    self.delete_message_for_me(chat, id);
+                }
+            }
+            Err(_) => self.emit(Event::Error("Could not recover pending deletions".into())),
+        }
+    }
+
+    /// Replays accepted work locally even offline, without relying on redelivery.
+    fn retry_confirmed_message_removals(&mut self) {
+        let Some(account) = self.me_pn.as_deref() else {
+            return;
+        };
+        match self.archive.confirmed_message_removals(account) {
+            Ok(pending) => {
+                for (chat, id) in pending {
+                    self.delete_message_here(&chat, &id);
+                }
+            }
+            Err(_) => self.emit(Event::Error("Could not recover confirmed deletions".into())),
+        }
+    }
+
+    /// Mapping can change while an attempt is running, but it is still one message.
+    fn message_removal_in_flight(&self, chat: &str, id: &str) -> bool {
+        let canonical = self.canonical_str(chat);
+        self.message_removals_in_flight
+            .iter()
+            .any(|(active, message)| message == id && self.canonical_str(active) == canonical)
+    }
+
+    /// Persists an accepted deletion and wakes the UI, including for unseen messages.
+    fn delete_message_here(&mut self, chat: &str, id: &str) {
+        let canonical = self.canonical_str(chat);
+        let mut aliases = vec![chat.to_owned(), canonical.clone()];
+        if let Some(pn) = canonical.strip_suffix("@s.whatsapp.net") {
+            aliases.extend(
+                self.lid_to_pn
+                    .iter()
+                    .filter(|(_, mapped)| mapped.as_str() == pn)
+                    .map(|(lid, _)| format!("{lid}@lid")),
+            );
+        }
+        aliases.sort_unstable();
+        aliases.dedup();
+        let account = self.me_pn.clone().or_else(|| {
+            self.client
+                .as_ref()
+                .and_then(|client| client.pn())
+                .map(|jid| jid.to_non_ad_string())
+        });
+        let Some(account) = account else {
+            self.emit(Event::Error(
+                "Could not identify the account for the confirmed deletion".into(),
+            ));
+            return;
+        };
+        if self
+            .archive
+            .confirm_message_removal(&account, &aliases, id)
+            .is_err()
+        {
+            self.emit(Event::Error(
+                "Could not save the confirmed deletion for local recovery".into(),
+            ));
+            return;
+        }
+        match self.archive.delete_message_aliases(&aliases, id) {
+            Ok(_) => {
+                for chat in aliases {
+                    self.emit(Event::MessageDeleted {
+                        chat: chat.clone(),
+                        id: id.to_owned(),
+                    });
+                    self.emit_chat(&chat);
+                }
+            }
+            Err(_) => self.emit(Event::Error(
+                "WhatsApp accepted the deletion, but ZapFast could not remove its copy. Local cleanup is saved for restart or reconnect".to_owned(),
+            )),
+        }
     }
 
     fn revoke(&mut self, chat: ChatId, id: String) {
@@ -9824,6 +10227,7 @@ pub(super) async fn file_outbound(
         read_at: None,
         quoted: None,
         reactions: Vec::new(),
+        history_order: None,
         edited: false,
         mentions: mentions
             .into_iter()
@@ -9871,6 +10275,10 @@ fn parse_history(compressed: &[u8]) -> Result<ParsedHistory, String> {
 }
 
 fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
+    let mut diagnostics = HistoryDiagnostics {
+        entries: conversation.messages.len(),
+        ..Default::default()
+    };
     let mut messages = Vec::new();
     let mut revoked = Vec::new();
     let mut poll_updates = Vec::new();
@@ -9878,22 +10286,81 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
     let mut newest = 0;
     for entry in &conversation.messages {
         let Some(info) = entry.message.as_option() else {
+            diagnostics.missing_envelope += 1;
             continue;
         };
         let Some(key) = info.key.as_option() else {
+            diagnostics.missing_key += 1;
             continue;
         };
         let Some(id) = key.id.clone().filter(|id| !id.is_empty()) else {
+            diagnostics.missing_key += 1;
             continue;
         };
-        let Some(message) = info.message.as_option() else {
+        let Some(original) = info.message.as_option() else {
+            diagnostics.missing_body += 1;
+            diagnostics.ciphertext_stubs += usize::from(
+                info.message_stub_type == Some(wa::web_message_info::StubType::CIPHERTEXT),
+            );
+            diagnostics.futureproof_body += usize::from(info.futureproof_data.is_some());
             continue;
         };
         let from_me = key.from_me.unwrap_or(false);
         let timestamp = info.message_timestamp.unwrap_or(0) as i64;
         newest = newest.max(timestamp);
+        let base = original.get_base_message();
+        if let Some(protocol) = base.protocol_message.as_option()
+            && protocol.r#type == Some(wa::message::protocol_message::Type::MESSAGE_EDIT)
+        {
+            diagnostics.edit_without_key += usize::from(
+                protocol
+                    .key
+                    .as_option()
+                    .and_then(|key| key.id.as_ref())
+                    .is_none_or(String::is_empty),
+            );
+            diagnostics.edit_without_body += usize::from(protocol.edited_message.is_unset());
+        }
+        diagnostics.edited_wrappers += usize::from(original.edited_message.is_set());
+        diagnostics.encrypted_edits += usize::from(
+            base.secret_encrypted_message
+                .as_option()
+                .is_some_and(|envelope| {
+                    envelope.secret_enc_type
+                        == Some(wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT)
+                }),
+        );
+        // In history MESSAGE_EDIT is a complete snapshot: the outer key is
+        // the latest edit's key, while protocol.key names the original bubble.
+        // Keep the history envelope's timestamp/order and use the target id.
+        // WA Web does this in WAWebParseHistorySyncProtocolMessageEditProto.
+        let snapshot = base.protocol_message.as_option().and_then(|protocol| {
+            (protocol.r#type == Some(wa::message::protocol_message::Type::MESSAGE_EDIT))
+                .then_some(protocol)
+                .and_then(|protocol| {
+                    let target = protocol
+                        .key
+                        .as_option()?
+                        .id
+                        .as_deref()
+                        .filter(|id| !id.is_empty())?;
+                    Some((target, protocol.edited_message.as_option()?))
+                })
+        });
+        diagnostics.rekeyed_edit_snapshots +=
+            usize::from(snapshot.is_some_and(|(target, _)| target != id));
+        let (id, message) = snapshot.map_or((id, original), |(target, edited)| {
+            (target.to_owned(), edited)
+        });
+        let edited = snapshot.is_some() || original.edited_message.is_set();
+        diagnostics.edit_snapshots += usize::from(snapshot.is_some());
         let base = message.get_base_message();
         if let Some(protocol) = base.protocol_message.as_option() {
+            if protocol.r#type == Some(wa::message::protocol_message::Type::MESSAGE_EDIT) {
+                diagnostics.invalid_edits += 1;
+            } else {
+                diagnostics.other_protocol += 1;
+            }
             if protocol.r#type == Some(wa::message::protocol_message::Type::REVOKE)
                 && let Some(target) = protocol.key.as_option().and_then(|key| key.id.clone())
             {
@@ -9959,8 +10426,19 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
             continue;
         }
         let Some(mut content) = classify(message) else {
+            diagnostics.unclassified += 1;
             continue;
         };
+        // Normalizing an edit must not remove an outer view-once restriction.
+        if original.is_view_once()
+            && let Some(kind) = crate::model::OnceMedia::of(&content)
+        {
+            content = Content::PhoneOnly {
+                view_once: true,
+                live_location: false,
+                once: Some(kind),
+            };
+        }
         if matches!(content, Content::LiveLocation { .. })
             && let Some(last) = info.final_live_location.as_option()
         {
@@ -9982,6 +10460,8 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
         };
         // A group's individual receipts may be only a partial list. Only the
         // phone's aggregate status proves delivery/read for historical groups.
+        // A zero receipt time proves nothing: WhatsApp sends one when a
+        // contact does not share read receipts.
         if from_me
             && ChatKind::from_id(&conversation.id) != ChatKind::Group
             && status < Delivery::Read
@@ -9989,14 +10469,14 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
             if info
                 .user_receipt
                 .iter()
-                .any(|receipt| receipt.read_timestamp.is_some())
+                .any(|receipt| receipt.read_timestamp.is_some_and(|at| at > 0))
             {
                 status = Delivery::Read;
             } else if status < Delivery::Delivered
                 && info
                     .user_receipt
                     .iter()
-                    .any(|receipt| receipt.receipt_timestamp.is_some())
+                    .any(|receipt| receipt.receipt_timestamp.is_some_and(|at| at > 0))
             {
                 status = Delivery::Delivered;
             }
@@ -10034,6 +10514,10 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
             from_me,
             push_name: non_empty(&info.push_name),
             timestamp,
+            history_order: entry
+                .msg_order_id
+                .and_then(|order| i64::try_from(order).ok()),
+            edited,
             content,
             status,
             quoted,
@@ -10041,8 +10525,25 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
             mentions: mentioned_of(base),
             forwarded: forwarded_of(base),
             thumbnail: thumbnail_of(base),
-            raw: message.encode_to_vec(),
-            poll_secret: info.message_secret.clone(),
+            raw: if original.is_view_once() {
+                original
+            } else {
+                message
+            }
+            .encode_to_vec(),
+            poll_secret: info.message_secret.clone().or_else(|| {
+                original
+                    .message_context_info
+                    .as_option()
+                    .and_then(|context| context.message_secret.clone())
+                    .or_else(|| {
+                        original
+                            .get_base_message()
+                            .message_context_info
+                            .as_option()
+                            .and_then(|context| context.message_secret.clone())
+                    })
+            }),
             poll_votes: info.poll_updates.clone(),
             receipts: if from_me {
                 info.user_receipt.clone()
@@ -10067,6 +10568,7 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
             | End::COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS => false,
         });
     ParsedChat {
+        diagnostics,
         id: conversation.id.clone(),
         name: non_empty(&conversation.display_name).or_else(|| non_empty(&conversation.name)),
         unread: conversation.unread_count,
@@ -10202,6 +10704,7 @@ mod tests {
                 mentions: Vec::new(),
             }),
             reactions: Vec::new(),
+            history_order: None,
             edited: false,
             mentions: Vec::new(),
             forwarded: false,
@@ -11957,6 +12460,7 @@ mod tests {
                 from_me: false,
                 emoji: "👍".into(),
             }],
+            history_order: None,
             edited: true,
             mentions: Vec::new(),
             forwarded: false,
@@ -12613,6 +13117,7 @@ mod receipt_tests {
             privacy_warned: false,
             privacy_recovering: false,
             privacy_generation: 0,
+            message_removals_in_flight: HashSet::new(),
             privacy_retry: Instant::now(),
             withheld_pages: Vec::new(),
             dirs: crate::paths::AppDirs::under(&root).as_account(),
@@ -12646,6 +13151,7 @@ mod receipt_tests {
             group_info_retry: Vec::new(),
             presence_subscribed: HashSet::new(),
             download_folder: None,
+            keep_chats_archived: true,
             online_wanted: false,
             online_changed: Instant::now(),
             online_sent: None,
@@ -12679,6 +13185,7 @@ mod receipt_tests {
             link_watch: Default::default(),
             forward_queue: None,
         };
+        worker.archive.set_meta("me_pn", ME).unwrap();
         (worker, events_rx, inbox, wa_events)
     }
 
@@ -12812,6 +13319,7 @@ mod receipt_tests {
             read_at: None,
             quoted: None,
             reactions: Vec::new(),
+            history_order: None,
             edited: false,
             mentions: Vec::new(),
             forwarded: false,
@@ -13138,6 +13646,428 @@ mod receipt_tests {
         assert_eq!(stored.reactions[0].emoji, "🏆");
         assert!(!stored.reactions[0].from_me);
         assert_eq!(stored.reactions[0].sender, reactor);
+    }
+
+    fn file_history_entries(worker: &mut Worker, messages: Vec<wa::HistorySyncMsg>) {
+        worker.apply_history(
+            ParsedHistory {
+                chats: vec![parse_conversation(wa::Conversation {
+                    id: PEER.into(),
+                    messages,
+                    ..Default::default()
+                })],
+                push_names: Vec::new(),
+                lids: Vec::new(),
+                stickers: Vec::new(),
+            },
+            false,
+        );
+    }
+
+    #[test]
+    fn history_diagnostics_describe_edit_snapshots_without_personal_data() {
+        let edit = wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                key: MessageField::some(wa::MessageKey {
+                    id: Some("private-parent-id".into()),
+                    ..Default::default()
+                }),
+                edited_message: MessageField::some(wa::Message::text("Private fixture body")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut absent = history_entry(
+            PEER,
+            "private-missing-id",
+            false,
+            None,
+            wa::Message::default(),
+            Vec::new(),
+            None,
+        );
+        let absent_info = absent.message.as_option_mut().unwrap();
+        absent_info.message = MessageField::none();
+        absent_info.message_stub_type = Some(wa::web_message_info::StubType::CIPHERTEXT);
+        let parsed = parse_conversation(wa::Conversation {
+            id: PEER.into(),
+            messages: vec![
+                history_entry(PEER, "private-edit-id", false, None, edit, Vec::new(), None),
+                history_entry(
+                    PEER,
+                    "private-visible-id",
+                    false,
+                    None,
+                    wa::Message::text("Private fixture body"),
+                    Vec::new(),
+                    None,
+                ),
+                absent,
+            ],
+            ..Default::default()
+        });
+        assert_eq!(parsed.diagnostics.entries, 3);
+        assert_eq!(parsed.diagnostics.rekeyed_edit_snapshots, 1);
+        assert_eq!(parsed.diagnostics.edit_snapshots, 1);
+        assert_eq!(parsed.diagnostics.missing_body, 1);
+        assert_eq!(parsed.diagnostics.ciphertext_stubs, 1);
+        assert_eq!(parsed.messages.len(), 2);
+        let report = format!("{:?}", parsed.diagnostics);
+        assert!(!report.contains("private-"));
+        assert!(!report.contains("Private fixture body"));
+        assert!(!report.contains(PEER));
+    }
+
+    #[test]
+    fn history_fidelity_keeps_the_phones_order_within_one_second() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let entries = [("third", 3), ("first", 1), ("second", 2)]
+            .into_iter()
+            .map(|(id, order)| {
+                let mut entry = history_entry(
+                    PEER,
+                    id,
+                    false,
+                    None,
+                    wa::Message::text(id),
+                    Vec::new(),
+                    None,
+                );
+                entry.msg_order_id = Some(order);
+                entry
+            })
+            .collect();
+        file_history_entries(&mut worker, entries);
+        let messages = worker.archive.messages(PEER, None, 10).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"],
+        );
+    }
+
+    #[test]
+    fn history_fidelity_keeps_an_edited_reply_snapshot() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let edited = wa::Message::text_with_context(
+            "Updated fixture reply",
+            wa::ContextInfo {
+                stanza_id: Some("quoted-fixture".into()),
+                participant: Some(PEER.into()),
+                quoted_message: MessageField::some(wa::Message::text("Original fixture")),
+                ..Default::default()
+            },
+        );
+        let raw = wa::Message {
+            message_context_info: MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![7; 32]),
+                ..Default::default()
+            }),
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                key: MessageField::some(wa::MessageKey {
+                    id: Some("edited-reply".into()),
+                    remote_jid: Some(PEER.into()),
+                    from_me: Some(false),
+                    ..Default::default()
+                }),
+                edited_message: MessageField::some(edited),
+                timestamp_ms: Some(110_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        file_history_entries(
+            &mut worker,
+            vec![history_entry(
+                PEER,
+                "edited-reply",
+                false,
+                None,
+                raw,
+                Vec::new(),
+                None,
+            )],
+        );
+        let message = worker
+            .archive
+            .message(PEER, "edited-reply")
+            .unwrap()
+            .expect("an edited history row is a message, not disposable protocol traffic");
+        assert_eq!(message.content, Content::text("Updated fixture reply"));
+        assert_eq!(message.timestamp, 100, "keep the original send time");
+        assert!(message.edited);
+        let raw = worker.archive.raw(PEER, "edited-reply").unwrap().unwrap();
+        let raw = wa::Message::decode_from_slice(&raw).unwrap();
+        assert_eq!(classify(&raw), Some(Content::text("Updated fixture reply")));
+        assert_eq!(
+            raw.message_context_info.as_option().unwrap().message_secret,
+            Some(vec![7; 32])
+        );
+        assert_eq!(message.quoted.unwrap().id, "quoted-fixture");
+    }
+
+    #[test]
+    fn history_fidelity_keeps_edit_wrappers_and_view_once_restrictions() {
+        let edited = wa::Message {
+            edited_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message::text("Updated fixture")),
+            }),
+            ..Default::default()
+        };
+        let protected = wa::Message {
+            view_once_message_v2: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message {
+                    protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                        r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                        key: MessageField::some(wa::MessageKey {
+                            id: Some("protected".into()),
+                            ..Default::default()
+                        }),
+                        edited_message: MessageField::some(wa::Message {
+                            image_message: MessageField::some(wa::message::ImageMessage {
+                                caption: Some("Updated fixture caption".into()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let (mut worker, _events, _inbox, _wa) = worker();
+        file_history_entries(
+            &mut worker,
+            vec![
+                history_entry(PEER, "wrapped", false, None, edited, Vec::new(), None),
+                history_entry(PEER, "protected", false, None, protected, Vec::new(), None),
+            ],
+        );
+        let wrapped = worker.archive.message(PEER, "wrapped").unwrap().unwrap();
+        assert!(wrapped.edited);
+        assert_eq!(wrapped.content, Content::text("Updated fixture"));
+        let protected = worker.archive.message(PEER, "protected").unwrap().unwrap();
+        assert!(matches!(
+            protected.content,
+            Content::PhoneOnly {
+                view_once: true,
+                ..
+            }
+        ));
+        let raw = worker.archive.raw(PEER, "protected").unwrap().unwrap();
+        assert!(wa::Message::decode_from_slice(&raw).unwrap().is_view_once());
+    }
+
+    #[test]
+    fn history_fidelity_replay_keeps_existing_edits_and_revokes() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        for (id, content, edited) in [
+            ("edited", Content::text("Updated fixture"), true),
+            ("revoked", Content::Revoked, false),
+        ] {
+            let entry = || {
+                history_entry(
+                    PEER,
+                    id,
+                    false,
+                    None,
+                    wa::Message::text("Original fixture"),
+                    Vec::new(),
+                    None,
+                )
+            };
+            file_history_entries(&mut worker, vec![entry()]);
+            worker
+                .archive
+                .set_content(PEER, id, &content, edited)
+                .unwrap();
+            let raw = worker.archive.raw(PEER, id).unwrap();
+            let mut replay = entry();
+            replay.msg_order_id = Some(42);
+            file_history_entries(&mut worker, vec![replay]);
+            let stored = worker.archive.message(PEER, id).unwrap().unwrap();
+            assert_eq!(stored.content, content);
+            assert_eq!(stored.edited, edited);
+            assert_eq!(stored.history_order, Some(42));
+            assert_eq!(worker.archive.raw(PEER, id).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn history_fidelity_rekeys_an_edited_history_snapshot_to_its_original() {
+        let raw = wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                key: MessageField::some(wa::MessageKey {
+                    id: Some("original-id".into()),
+                    ..Default::default()
+                }),
+                edited_message: MessageField::some(wa::Message::text("Updated fixture")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let parsed = parse_conversation(wa::Conversation {
+            id: PEER.into(),
+            messages: vec![history_entry(
+                PEER,
+                "separate-edit-id",
+                false,
+                None,
+                raw,
+                Vec::new(),
+                None,
+            )],
+            ..Default::default()
+        });
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].id, "original-id");
+        assert_eq!(parsed.messages[0].content, Content::text("Updated fixture"));
+        assert!(parsed.messages[0].edited);
+        assert_eq!(parsed.messages[0].timestamp, 100);
+    }
+
+    // WA Web 2.3000.1045368834, whatspec 1a441f0329c941fcdb238490a6c604550d8a9939:
+    // WAWebParseHistorySyncProtocolMessageEditProto keeps base metadata, parses
+    // editedMessage, then replaces id with protocol.key. The outer key identifies
+    // the latest edit; it need not identify a separate event or an archived row.
+    #[test]
+    fn history_fidelity_restores_rekeyed_reply_without_an_original() {
+        for original_present in [false, true] {
+            let (mut worker, _events, _inbox, _wa) = worker();
+            if original_present {
+                file_history_entries(
+                    &mut worker,
+                    vec![history_entry(
+                        PEER,
+                        "original-reply",
+                        false,
+                        None,
+                        wa::Message::text("Before editing"),
+                        Vec::new(),
+                        None,
+                    )],
+                );
+            }
+            let snapshot = || {
+                let body = wa::Message::text_with_context(
+                    "Updated fixture reply",
+                    wa::ContextInfo {
+                        stanza_id: Some("quoted-fixture".into()),
+                        participant: Some(ME.into()),
+                        quoted_message: MessageField::some(wa::Message::text("Earlier fixture")),
+                        ..Default::default()
+                    },
+                );
+                let mut entry = history_entry(
+                    PEER,
+                    "latest-edit-id",
+                    false,
+                    None,
+                    wa::Message {
+                        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                            key: MessageField::some(wa::MessageKey {
+                                id: Some("original-reply".into()),
+                                // Inner keys may use the sender's perspective.
+                                from_me: Some(true),
+                                ..Default::default()
+                            }),
+                            edited_message: MessageField::some(body),
+                            timestamp_ms: Some(115_000),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                    Some(vec![7; 32]),
+                );
+                entry.msg_order_id = Some(5);
+                entry
+            };
+            // Replaying the same snapshot must also keep a single original row.
+            for _ in 0..2 {
+                file_history_entries(&mut worker, vec![snapshot()]);
+                let messages = worker.archive.messages(PEER, None, 10).unwrap();
+                assert_eq!(messages.len(), 1);
+                let row = &messages[0];
+                assert_eq!(row.id, "original-reply");
+                assert_eq!(
+                    row.timestamp, 100,
+                    "history envelope supplies the send time"
+                );
+                assert_eq!(row.history_order, Some(5));
+                assert_eq!(row.sender, PEER);
+                assert!(!row.from_me);
+                assert!(row.edited);
+                assert_eq!(row.content, Content::text("Updated fixture reply"));
+                assert_eq!(row.quoted.as_ref().unwrap().id, "quoted-fixture");
+                let raw = worker.archive.raw(PEER, &row.id).unwrap().unwrap();
+                assert_eq!(
+                    classify(&wa::Message::decode_from_slice(&raw).unwrap()),
+                    Some(row.content.clone())
+                );
+                assert_eq!(message_secret_from_raw(&raw), Some(vec![7; 32]));
+                assert!(
+                    worker
+                        .archive
+                        .message(PEER, "latest-edit-id")
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            worker
+                .archive
+                .delete_message(PEER, "original-reply")
+                .unwrap();
+            file_history_entries(&mut worker, vec![snapshot()]);
+            assert!(
+                worker.archive.messages(PEER, None, 10).unwrap().is_empty(),
+                "a rekeyed snapshot must respect the original message's deletion"
+            );
+        }
+    }
+
+    #[test]
+    fn history_fidelity_rejects_edit_snapshots_without_a_target_or_body() {
+        for (target, body) in [
+            (None, Some(wa::Message::text("Fixture"))),
+            (Some(""), Some(wa::Message::text("Fixture"))),
+            (Some("original"), None),
+        ] {
+            let parsed = parse_conversation(wa::Conversation {
+                id: PEER.into(),
+                messages: vec![history_entry(
+                    PEER,
+                    "edit-id",
+                    false,
+                    None,
+                    wa::Message {
+                        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                            key: MessageField::some(wa::MessageKey {
+                                id: target.map(str::to_owned),
+                                ..Default::default()
+                            }),
+                            edited_message: body.into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                    None,
+                )],
+                ..Default::default()
+            });
+            assert!(parsed.messages.is_empty());
+            assert_eq!(parsed.diagnostics.invalid_edits, 1);
+        }
     }
 
     #[test]
@@ -13523,6 +14453,68 @@ mod receipt_tests {
         assert_eq!(receipts[0].read_at, Some(123));
     }
 
+    #[test]
+    fn a_zero_history_receipt_time_neither_reads_nor_dates_a_message() {
+        use wa::web_message_info::Status;
+        let conversation = |id: &str, status| {
+            parse_conversation(wa::Conversation {
+                id: PEER.into(),
+                messages: vec![wa::HistorySyncMsg {
+                    message: MessageField::some(wa::WebMessageInfo {
+                        key: MessageField::some(wa::MessageKey {
+                            id: Some(id.into()),
+                            from_me: Some(true),
+                            ..Default::default()
+                        }),
+                        message: MessageField::some(wa::Message {
+                            conversation: Some("hello".into()),
+                            ..Default::default()
+                        }),
+                        message_timestamp: Some(90),
+                        status: Some(status),
+                        user_receipt: vec![wa::UserReceipt {
+                            user_jid: PEER.into(),
+                            receipt_timestamp: Some(100),
+                            read_timestamp: Some(0),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+        // A contact who hides read receipts: the phone says delivered.
+        let hidden = conversation("hidden", Status::DELIVERY_ACK);
+        assert_eq!(hidden.messages[0].status, Delivery::Delivered);
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let mut chats = vec![hidden];
+        // The phone says read, but the receipt carries no read time.
+        chats[0]
+            .messages
+            .extend(conversation("read", Status::READ).messages);
+        worker.apply_history(
+            ParsedHistory {
+                chats,
+                push_names: Vec::new(),
+                lids: Vec::new(),
+                stickers: Vec::new(),
+            },
+            true,
+        );
+        let hidden = worker.archive.message(PEER, "hidden").unwrap().unwrap();
+        assert_eq!(hidden.status, Delivery::Delivered);
+        assert_eq!(hidden.read_at, None);
+        assert_eq!(hidden.delivered_at, Some(100));
+        let read = worker.archive.message(PEER, "read").unwrap().unwrap();
+        assert_eq!(read.status, Delivery::Read);
+        assert_eq!(
+            read.read_at, None,
+            "\"Message info\" says the time was not recorded"
+        );
+    }
+
     /// A duplicate delivery or a history replay reclassifies the same message,
     /// and a fresh classification carries no local path. Replacing the row with
     /// it dropped the file that is already on the computer, so the bubble went
@@ -13839,6 +14831,39 @@ mod receipt_tests {
         unarchived.chats[0].archived = Some(false);
         worker.apply_history(unarchived, true);
         assert!(!worker.archive.chat(PEER).unwrap().unwrap().archived);
+    }
+
+    #[tokio::test]
+    async fn new_messages_unarchive_only_when_chats_are_not_kept_archived() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let archived = |worker: &Worker| worker.archive.chat(PEER).unwrap().unwrap().archived;
+        worker.store_message(incoming("before", 100), None, None);
+        worker.archive.set_archived_at(PEER, true, 200_000).unwrap();
+        // Kept archived, the default, as ZapFast always behaved.
+        worker.store_message(incoming("kept", 300), None, None);
+        assert!(archived(&worker));
+
+        worker
+            .handle_command(Command::SetKeepChatsArchived(false))
+            .await;
+        // A late delivery from before the archiving leaves it there, and so
+        // does a duplicate of a message filed while it was kept.
+        worker.store_message(incoming("late", 150), None, None);
+        worker.store_message(incoming("kept", 300), None, None);
+        assert!(archived(&worker));
+        worker.store_message(incoming("new", 400), None, None);
+        assert!(!archived(&worker));
+
+        // An app-state archive after that message still applies, and our own
+        // message sent later brings the chat back again.
+        worker.archive.set_archived_at(PEER, true, 500_000).unwrap();
+        assert!(archived(&worker));
+        worker.store_message(own_message("reply", 600), None, None);
+        assert!(!archived(&worker));
+        let mut stale = history(0);
+        stale.chats[0].archived = Some(true);
+        worker.apply_history(stale, true);
+        assert!(!archived(&worker), "history cannot undo it");
     }
 
     #[test]
@@ -14810,6 +15835,294 @@ mod chat_removal_tests {
 
     const CHAT: &str = "4915700000001@s.whatsapp.net";
 
+    /// An incoming confirmation survives failed cleanup and recovers offline.
+    #[tokio::test]
+    async fn incoming_confirmation_is_recoverable_after_storage_failure() {
+        let (mut worker, events, _, _) = receipt_tests::worker();
+        worker.apply_history(history(CHAT, &[100, 200]), true);
+        crate::archive::tests::set_message_deletion_failure(&worker.archive, true);
+        worker
+            .handle_wa_event(Arc::new(wa_events::Event::DeleteMessageForMeUpdate(
+                wa_events::DeleteMessageForMeUpdate::builder()
+                    .chat_jid(CHAT.parse().unwrap())
+                    .message_id("m100".to_owned())
+                    .from_me(true)
+                    .timestamp(std::time::SystemTime::now().into())
+                    .action(Box::default())
+                    .from_full_sync(false)
+                    .build(),
+            )))
+            .await;
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Error(_)))
+        );
+        assert_eq!(
+            worker
+                .archive
+                .confirmed_message_removals(&worker.me())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            worker
+                .archive
+                .pending_message_removals(&worker.me())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(worker.archive.message_removed(CHAT, "m100").unwrap());
+        worker.apply_history(history(CHAT, &[100, 200]), false);
+        crate::archive::tests::set_message_deletion_failure(&worker.archive, false);
+        assert!(worker.client.is_none());
+        worker.retry_confirmed_message_removals();
+        assert_eq!(stored(&worker, CHAT), ["m200"]);
+        assert!(
+            worker
+                .archive
+                .confirmed_message_removals(&worker.me())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(worker.archive.message_removed(CHAT, "m100").unwrap());
+    }
+
+    /// A callback from the old bot stays fenced even when delivered after unlink.
+    #[tokio::test]
+    async fn stale_incoming_deletion_does_not_repopulate_an_unlinked_archive() {
+        let (mut worker, events, _, _) = receipt_tests::worker();
+        let (sender, mut inbox) = mpsc::unbounded_channel();
+        let old = UiEvents {
+            sender: sender.clone(),
+            generation: 0,
+        };
+        worker.privacy_generation = 1;
+        worker.archive.clear().unwrap();
+        let deletion = |id: &str| {
+            Arc::new(wa_events::Event::DeleteMessageForMeUpdate(
+                wa_events::DeleteMessageForMeUpdate::builder()
+                    .chat_jid(CHAT.parse().unwrap())
+                    .message_id(id.to_owned())
+                    .from_me(true)
+                    .timestamp(std::time::SystemTime::now().into())
+                    .action(Box::default())
+                    .from_full_sync(false)
+                    .build(),
+            ))
+        };
+        wa_events::EventHandler::handle_event(&old, deletion("m100"));
+        let RuntimeEvent::MessageRemoval { generation, event } = inbox.try_recv().unwrap() else {
+            panic!("deletion must be session tagged");
+        };
+        worker.handle_session_deletion(generation, event).await;
+        assert!(!worker.archive.message_removed(CHAT, "m100").unwrap());
+        assert!(
+            events
+                .try_iter()
+                .all(|event| !matches!(event, Event::MessageDeleted { .. }))
+        );
+        worker.apply_history(history(CHAT, &[100, 200]), true);
+        assert_eq!(stored(&worker, CHAT), ["m100", "m200"]);
+        let current = UiEvents {
+            sender,
+            generation: 1,
+        };
+        wa_events::EventHandler::handle_event(&current, deletion("m200"));
+        let RuntimeEvent::MessageRemoval { generation, event } = inbox.try_recv().unwrap() else {
+            panic!("deletion must be session tagged");
+        };
+        worker.handle_session_deletion(generation, event).await;
+        assert_eq!(stored(&worker, CHAT), ["m100"]);
+        assert!(worker.archive.message_removed(CHAT, "m200").unwrap());
+    }
+
+    /// Mapping discovered after canonical acceptance also removes the old copy.
+    #[tokio::test]
+    async fn deletion_before_mapping_reconciles_the_original_copy() {
+        let (mut worker, events, _, _) = receipt_tests::worker();
+        worker.apply_history(history(CHAT, &[100, 200]), true);
+        worker
+            .archive
+            .insert_message(
+                &crate::archive::tests::message("9@lid", "m100", 100, true),
+                None,
+            )
+            .unwrap();
+        worker
+            .archive
+            .queue_message_removal(&worker.me(), "9@lid", "m100")
+            .unwrap();
+        worker
+            .handle_wa_event(Arc::new(wa_events::Event::DeleteMessageForMeUpdate(
+                wa_events::DeleteMessageForMeUpdate::builder()
+                    .chat_jid(CHAT.parse().unwrap())
+                    .message_id("m100".to_owned())
+                    .from_me(true)
+                    .timestamp(std::time::SystemTime::now().into())
+                    .action(Box::default())
+                    .from_full_sync(false)
+                    .build(),
+            )))
+            .await;
+        events.try_iter().for_each(drop);
+        worker.learn_lid("9", CHAT.split('@').next().unwrap());
+        assert!(worker.archive.message("9@lid", "m100").unwrap().is_none());
+        assert!(worker.archive.message_removed("9@lid", "m100").unwrap());
+        assert!(
+            worker
+                .archive
+                .pending_message_removals(&worker.me())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(stored(&worker, CHAT), ["m200"]);
+        assert!(events.try_iter().any(|event| matches!(event, Event::MessageDeleted { chat, id } if chat == "9@lid" && id == "m100")));
+    }
+
+    /// Incoming acceptance cleans every alias even after the local reply is lost.
+    #[tokio::test]
+    async fn incoming_deletion_reconciles_all_known_aliases() {
+        for source in [CHAT, "9@lid"] {
+            let (mut worker, events, _, _) = receipt_tests::worker();
+            worker.apply_history(history(CHAT, &[100, 200]), true);
+            for lid in ["9@lid", "10@lid"] {
+                worker
+                    .archive
+                    .insert_message(
+                        &crate::archive::tests::message(lid, "m100", 100, true),
+                        None,
+                    )
+                    .unwrap();
+                worker
+                    .archive
+                    .queue_message_removal(&worker.me(), lid, "m100")
+                    .unwrap();
+                worker
+                    .handle_command(Command::MessageDeletedForMe {
+                        generation: 0,
+                        chat: lid.into(),
+                        id: "m100".into(),
+                        outcome: MessageRemovalOutcome::Uncertain,
+                    })
+                    .await;
+                worker.learn_lid(
+                    lid.split('@').next().unwrap(),
+                    CHAT.split('@').next().unwrap(),
+                );
+            }
+            events.try_iter().for_each(drop);
+            worker
+                .handle_wa_event(Arc::new(wa_events::Event::DeleteMessageForMeUpdate(
+                    wa_events::DeleteMessageForMeUpdate::builder()
+                        .chat_jid(source.parse().unwrap())
+                        .message_id("m100".to_owned())
+                        .from_me(true)
+                        .timestamp(std::time::SystemTime::now().into())
+                        .action(Box::default())
+                        .from_full_sync(false)
+                        .build(),
+                )))
+                .await;
+            assert!(
+                worker
+                    .archive
+                    .pending_message_removals(&worker.me())
+                    .unwrap()
+                    .is_empty()
+            );
+            let notified: HashSet<_> = events
+                .try_iter()
+                .filter_map(|event| match event {
+                    Event::MessageDeleted { chat, id } if id == "m100" => Some(chat),
+                    _ => None,
+                })
+                .collect();
+            for chat in [CHAT, "9@lid", "10@lid"] {
+                assert!(worker.archive.message(chat, "m100").unwrap().is_none());
+                assert!(worker.archive.message_removed(chat, "m100").unwrap());
+                assert!(notified.contains(chat));
+                worker
+                    .archive
+                    .insert_message(
+                        &crate::archive::tests::message(chat, "m100", 100, true),
+                        None,
+                    )
+                    .unwrap();
+                assert!(worker.archive.message(chat, "m100").unwrap().is_none());
+            }
+            assert_eq!(stored(&worker, CHAT), ["m200"]);
+        }
+    }
+
+    /// Lost acknowledgements retain intent and rows until acceptance is known.
+    #[tokio::test]
+    async fn uncertain_deletion_remains_recoverable() {
+        use whatsapp_rust::AppStateError;
+        let (mut worker, events, _, _) = receipt_tests::worker();
+        worker.apply_history(history(CHAT, &[100]), true);
+        worker
+            .archive
+            .queue_message_removal(&worker.me(), CHAT, "m100")
+            .unwrap();
+        for error in [
+            AppStateError::NotConnected,
+            AppStateError::Internal(anyhow::anyhow!("fixture lost acknowledgement")),
+            AppStateError::InvalidRequest("no app state sync key available".into()),
+        ] {
+            worker
+                .message_removals_in_flight
+                .insert((CHAT.into(), "m100".into()));
+            let outcome = message_removal_outcome(Err(error));
+            assert_eq!(outcome, MessageRemovalOutcome::Uncertain);
+            worker
+                .handle_command(Command::MessageDeletedForMe {
+                    generation: 0,
+                    chat: CHAT.into(),
+                    id: "m100".into(),
+                    outcome,
+                })
+                .await;
+            assert!(!worker.message_removal_in_flight(CHAT, "m100"));
+            assert_eq!(stored(&worker, CHAT), ["m100"]);
+            assert!(!worker.archive.message_removed(CHAT, "m100").unwrap());
+            worker.retry_message_removals();
+            assert_eq!(
+                worker
+                    .archive
+                    .pending_message_removals(&worker.me())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        assert!(
+            events
+                .try_iter()
+                .all(|event| !matches!(event, Event::MessageDeleted { .. }))
+        );
+        let outcome = message_removal_outcome(Ok(()));
+        assert_eq!(outcome, MessageRemovalOutcome::Accepted);
+        worker
+            .handle_command(Command::MessageDeletedForMe {
+                generation: 0,
+                chat: CHAT.into(),
+                id: "m100".into(),
+                outcome,
+            })
+            .await;
+        assert!(
+            worker
+                .archive
+                .pending_message_removals(&worker.me())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(stored(&worker, CHAT).is_empty());
+        assert!(worker.archive.message_removed(CHAT, "m100").unwrap());
+    }
+
     #[tokio::test]
     async fn deletion_resolves_a_mapping_known_only_to_the_protocol_library() {
         let directory = tempfile::tempdir().unwrap();
@@ -14879,6 +16192,7 @@ mod chat_removal_tests {
     pub(super) fn history(chat: &str, timestamps: &[i64]) -> ParsedHistory {
         ParsedHistory {
             chats: vec![ParsedChat {
+                diagnostics: HistoryDiagnostics::default(),
                 id: chat.to_owned(),
                 name: Some("Somebody".into()),
                 unread: None,
@@ -14901,6 +16215,8 @@ mod chat_removal_tests {
                         from_me: false,
                         push_name: None,
                         timestamp: at,
+                        history_order: None,
+                        edited: false,
                         content: Content::text(format!("sent at {at}")),
                         status: Delivery::None,
                         quoted: None,
@@ -14962,6 +16278,265 @@ mod chat_removal_tests {
 
         worker.apply_history(history(CHAT, &[300]), false);
         assert_eq!(stored(&worker, CHAT), ["m300"]);
+    }
+
+    #[tokio::test]
+    /// Offline and refused account writes keep the row; acceptance blocks replay.
+    async fn individual_deletion_waits_for_sync_and_blocks_replay() {
+        let (mut worker, events, _, _) = receipt_tests::worker();
+        worker.apply_history(history(CHAT, &[100, 200]), true);
+        worker
+            .handle_command(Command::DeleteLocal {
+                chat: CHAT.into(),
+                id: "m100".into(),
+            })
+            .await;
+        assert_eq!(stored(&worker, CHAT), ["m100", "m200"]);
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Error(_)))
+        );
+        worker
+            .handle_command(Command::MessageDeletedForMe {
+                generation: 0,
+                chat: CHAT.into(),
+                id: "m100".into(),
+                outcome: MessageRemovalOutcome::Uncertain,
+            })
+            .await;
+        assert_eq!(stored(&worker, CHAT), ["m100", "m200"]);
+        worker
+            .handle_command(Command::MessageDeletedForMe {
+                generation: 0,
+                chat: CHAT.into(),
+                id: "m100".into(),
+                outcome: MessageRemovalOutcome::Accepted,
+            })
+            .await;
+        assert_eq!(stored(&worker, CHAT), ["m200"]);
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::MessageDeleted { id, .. } if id == "m100"))
+        );
+        worker.apply_history(history(CHAT, &[100, 200]), false);
+        worker.store_message(
+            crate::archive::tests::message(CHAT, "m100", 100, false),
+            None,
+            None,
+        );
+        assert_eq!(stored(&worker, CHAT), ["m200"]);
+    }
+
+    #[tokio::test]
+    /// An incoming deletion may precede the phone's first history page.
+    async fn phone_deletion_before_history_prevents_message_import() {
+        let (mut worker, _events, _, _) = receipt_tests::worker();
+        worker
+            .handle_wa_event(Arc::new(
+                whatsapp_rust::types::events::Event::DeleteMessageForMeUpdate(
+                    whatsapp_rust::types::events::DeleteMessageForMeUpdate::builder()
+                        .chat_jid(CHAT.parse().unwrap())
+                        .message_id("m100".to_owned())
+                        .from_me(false)
+                        .timestamp(std::time::SystemTime::now().into())
+                        .action(Box::default())
+                        .from_full_sync(true)
+                        .build(),
+                ),
+            ))
+            .await;
+        worker.apply_history(history(CHAT, &[100, 200]), true);
+        assert_eq!(stored(&worker, CHAT), ["m200"]);
+    }
+
+    /// Late mappings remove an already visible canonical copy and notify the UI.
+    #[test]
+    fn privacy_mapping_updates_visible_deletions() {
+        let (mut worker, events, _, _) = receipt_tests::worker();
+        worker.apply_history(history(CHAT, &[100, 200]), true);
+        worker.archive.delete_message("9@lid", "m100").unwrap();
+        worker.learn_lid("9", CHAT.split('@').next().unwrap());
+        assert_eq!(stored(&worker, CHAT), ["m200"]);
+        assert!(events.try_iter().any(|event|
+            matches!(event, Event::MessageDeleted { chat, id } if chat == CHAT && id == "m100")));
+    }
+
+    /// A completion from an unlinked account cannot delete the new account's row.
+    #[tokio::test]
+    async fn stale_deletion_completion_preserves_the_current_account() {
+        let (mut worker, _events, _, _) = receipt_tests::worker();
+        worker.apply_history(history(CHAT, &[100]), true);
+        worker
+            .archive
+            .queue_message_removal(&worker.me(), CHAT, "m100")
+            .unwrap();
+        worker.privacy_generation = 1;
+        worker
+            .handle_command(Command::MessageDeletedForMe {
+                generation: 0,
+                chat: CHAT.into(),
+                id: "m100".into(),
+                outcome: MessageRemovalOutcome::Accepted,
+            })
+            .await;
+        assert_eq!(stored(&worker, CHAT), ["m100"]);
+        assert_eq!(
+            worker
+                .archive
+                .pending_message_removals(&worker.me())
+                .unwrap()
+                .len(),
+            1
+        );
+        worker.retry_message_removals();
+        assert_eq!(
+            worker
+                .archive
+                .pending_message_removals(&worker.me())
+                .unwrap()
+                .len(),
+            1,
+            "offline recovery keeps the intent"
+        );
+        worker
+            .handle_command(Command::MessageDeletedForMe {
+                generation: 1,
+                chat: CHAT.into(),
+                id: "m100".into(),
+                outcome: MessageRemovalOutcome::Accepted,
+            })
+            .await;
+        assert!(stored(&worker, CHAT).is_empty());
+        assert!(
+            worker
+                .archive
+                .pending_message_removals(&worker.me())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A mapping learned during a request updates both identities on acceptance.
+    #[tokio::test]
+    async fn in_flight_deletion_follows_a_new_privacy_mapping() {
+        let (mut worker, events, _, _) = receipt_tests::worker();
+        let lid = "9@lid";
+        worker.apply_history(history(CHAT, &[100, 200]), true);
+        worker
+            .archive
+            .insert_message(
+                &crate::archive::tests::message(lid, "m100", 100, true),
+                None,
+            )
+            .unwrap();
+        worker
+            .archive
+            .queue_message_removal(&worker.me(), lid, "m100")
+            .unwrap();
+        worker
+            .message_removals_in_flight
+            .insert((lid.into(), "m100".into()));
+        worker.learn_lid("9", CHAT.split('@').next().unwrap());
+        assert!(worker.message_removal_in_flight(CHAT, "m100"));
+        events.try_iter().for_each(drop);
+        worker
+            .handle_command(Command::DeleteLocal {
+                chat: CHAT.into(),
+                id: "m100".into(),
+            })
+            .await;
+        worker.retry_message_removals();
+        assert!(
+            events.try_iter().next().is_none(),
+            "overlapping attempts never reach the client"
+        );
+        worker
+            .handle_command(Command::MessageDeletedForMe {
+                generation: 0,
+                chat: lid.into(),
+                id: "m100".into(),
+                outcome: MessageRemovalOutcome::Accepted,
+            })
+            .await;
+        assert!(!worker.message_removal_in_flight(CHAT, "m100"));
+        assert!(worker.archive.message_removed(CHAT, "m100").unwrap());
+        assert!(worker.archive.message_removed(lid, "m100").unwrap());
+        assert_eq!(stored(&worker, CHAT), ["m200"]);
+        assert!(
+            worker
+                .archive
+                .pending_message_removals(&worker.me())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(events.try_iter().any(|event|
+            matches!(event, Event::MessageDeleted { chat, id } if chat == CHAT && id == "m100")));
+        worker.apply_history(history(CHAT, &[100, 200]), false);
+        assert_eq!(stored(&worker, CHAT), ["m200"]);
+    }
+
+    /// Recovery never submits a surviving request belonging to another account.
+    #[test]
+    fn deletion_recovery_skips_other_accounts() {
+        let (mut worker, events, _, _) = receipt_tests::worker();
+        worker.apply_history(history(CHAT, &[100]), true);
+        worker
+            .archive
+            .queue_message_removal("old-account", CHAT, "m100")
+            .unwrap();
+        events.try_iter().for_each(drop);
+        worker.retry_message_removals();
+        assert!(events.try_iter().next().is_none());
+        assert_eq!(
+            worker
+                .archive
+                .pending_message_removals("old-account")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(stored(&worker, CHAT), ["m100"]);
+    }
+
+    /// Own group messages use the account deletion event without a participant key.
+    #[tokio::test]
+    async fn own_group_deletion_keeps_other_messages_and_other_chats() {
+        let (mut worker, events, _, _) = receipt_tests::worker();
+        let group = "1-1@g.us";
+        let other = "2-2@g.us";
+        for chat in [group, other] {
+            worker.archive.ensure_chat(chat, "Synthetic group").unwrap();
+            for id in ["own", "kept"] {
+                worker
+                    .archive
+                    .insert_message(&crate::archive::tests::message(chat, id, 100, true), None)
+                    .unwrap();
+            }
+        }
+        worker
+            .handle_wa_event(Arc::new(wa_events::Event::DeleteMessageForMeUpdate(
+                wa_events::DeleteMessageForMeUpdate::builder()
+                    .chat_jid(group.parse().unwrap())
+                    .message_id("own".to_owned())
+                    .from_me(true)
+                    .timestamp(std::time::SystemTime::now().into())
+                    .action(Box::default())
+                    .from_full_sync(false)
+                    .build(),
+            )))
+            .await;
+        assert_eq!(stored(&worker, group), ["kept"]);
+        assert_eq!(stored(&worker, other).len(), 2);
+        assert!(events.try_iter().any(|event|
+            matches!(event, Event::MessageDeleted { chat, id } if chat == group && id == "own")));
+        worker.store_message(
+            crate::archive::tests::message(group, "own", 100, true),
+            None,
+            None,
+        );
+        assert_eq!(stored(&worker, group), ["kept"]);
     }
 
     #[test]
@@ -15230,6 +16805,42 @@ mod older_history_tests {
             "the app stops asking"
         );
         assert!(worker.pending_older.is_empty());
+    }
+
+    #[test]
+    fn history_fidelity_reload_returns_overlapping_rows_before_its_anchor() {
+        let (mut worker, events, _, _) = receipt_tests::worker();
+        worker.apply_history(chat_removal_tests::history(CHAT, &[50, 100]), false);
+        worker.archive.set_history_start(CHAT).unwrap();
+        drain(&events);
+        // The reader chose m100, not the archive's oldest message m50.
+        waiting(&mut worker, true);
+        let filed = worker.apply_history(chat_removal_tests::history(CHAT, &[50, 75]), false);
+        worker.answer_older(filed);
+        let messages = drain(&events)
+            .into_iter()
+            .find_map(|event| match event {
+                Event::Messages {
+                    messages,
+                    older: true,
+                    ..
+                } => Some(messages),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["m50", "m75"]
+        );
+        assert!(worker.pending_older.is_empty());
+
+        // A known start prevents fetching older history, but not repairing it.
+        worker.reload_history(CHAT.into(), "m100".into());
+        assert_eq!(
+            fetched(&drain(&events)),
+            Some(true),
+            "offline, rather than refused at the chat start"
+        );
     }
 
     #[test]

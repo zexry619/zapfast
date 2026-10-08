@@ -438,6 +438,10 @@ pub struct Settings {
     /// Folder for new downloads. `None` keeps them in the cache. Files
     /// already downloaded stay where they are when this changes.
     pub download_folder: Option<std::path::PathBuf>,
+    /// Archived chats stay archived when a message arrives or is sent, as
+    /// with the phone's "Keep chats archived". Off, a new message brings the
+    /// chat back to the list.
+    pub keep_chats_archived: bool,
     /// Proxy for WhatsApp, media, and updates, such as
     /// `socks5h://127.0.0.1:9050`. Empty follows `ALL_PROXY` / `HTTPS_PROXY`.
     pub proxy: String,
@@ -479,6 +483,19 @@ pub struct Settings {
     pub call_speaker: Option<String>,
     /// Camera the next video call captures from, as a V4L2 capture node.
     pub call_camera: Option<String>,
+    /// Last window size in points, remembered across restarts. `None` uses
+    /// the default size.
+    pub window_width: Option<f32>,
+    /// Last window height in points. See [`Self::window_width`].
+    pub window_height: Option<f32>,
+    /// Last window position in points, as `ViewportBuilder::with_position`
+    /// takes it. `None` lets the window manager place the window, which is
+    /// also the case on Wayland where the position is not known.
+    pub window_x: Option<f32>,
+    /// Last window vertical position. See [`Self::window_x`].
+    pub window_y: Option<f32>,
+    /// Whether the window was maximized when it last closed.
+    pub window_maximized: bool,
 }
 
 impl Default for Settings {
@@ -513,6 +530,7 @@ impl Default for Settings {
             mention_sound: NotificationSound::Alert,
             group_sounds: true,
             download_folder: None,
+            keep_chats_archived: true,
             proxy: String::new(),
             check_for_updates: true,
             download_updates_automatically: false,
@@ -529,6 +547,11 @@ impl Default for Settings {
             call_microphone: None,
             call_speaker: None,
             call_camera: None,
+            window_width: None,
+            window_height: None,
+            window_x: None,
+            window_y: None,
+            window_maximized: false,
         }
     }
 }
@@ -582,6 +605,17 @@ impl Settings {
             .map(str::trim)
             .filter(|key| !key.is_empty())
             .map(str::to_owned)
+    }
+
+    /// The remembered window geometry for the next window.
+    pub fn window_geometry(&self) -> crate::window::Geometry {
+        crate::window::Geometry {
+            width: self.window_width,
+            height: self.window_height,
+            x: self.window_x,
+            y: self.window_y,
+            maximized: self.window_maximized,
+        }
     }
 
     pub fn load(path: &Path) -> Self {
@@ -900,6 +934,24 @@ mod tests {
         assert!(parsed.show_wallpaper);
         assert_eq!(parsed.wallpaper_color, WallpaperColor::Theme);
         assert!(parsed.pause_other_media);
+        assert_eq!(parsed.window_width, None);
+        assert_eq!(parsed.window_height, None);
+        assert_eq!(parsed.window_x, None);
+        assert_eq!(parsed.window_y, None);
+        assert!(!parsed.window_maximized);
+    }
+
+    #[test]
+    fn the_window_geometry_defaults_to_unset() {
+        // Files written before the window was remembered open with the
+        // default size; the full round-trip lives in `window::tests`.
+        let settings = Settings::default();
+        assert_eq!(
+            settings.window_geometry(),
+            crate::window::Geometry::default()
+        );
+        let older: Settings = serde_json::from_str(r#"{"zoom":1.25}"#).unwrap();
+        assert_eq!(older.window_geometry(), crate::window::Geometry::default());
     }
 
     fn load_from(contents: &str) -> (Settings, serde_json::Value) {

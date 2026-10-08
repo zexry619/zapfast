@@ -46,3 +46,4 @@ pub mod util;
 pub mod video;
 pub mod voice;
 pub mod wallpaper;
+pub mod window;
