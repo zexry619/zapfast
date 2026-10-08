@@ -39,6 +39,7 @@ pub(super) struct CallRuntime {
     last_bitrate_adjust: Instant,
     last_probe_up: Instant,
     last_keyframe_req: Instant,
+    last_peer_keyframe_req: Instant,
 }
 
 /// What a call's background tasks report back to the worker loop.
@@ -55,7 +56,7 @@ impl CallRuntime {
     pub(super) fn new(call: Call, frames: Option<async_channel::Receiver<VideoTick>>) -> Self {
         let (_tx, events) = async_channel::bounded(64);
         let last = call.update();
-        let (base_bitrate, min_bitrate, max_bitrate) = (450_000, 280_000, 750_000);
+        let (base_bitrate, min_bitrate, max_bitrate) = (320_000, 180_000, 600_000);
         Self {
             call,
             events,
@@ -71,6 +72,7 @@ impl CallRuntime {
             last_bitrate_adjust: Instant::now(),
             last_probe_up: Instant::now(),
             last_keyframe_req: Instant::now() - Duration::from_secs(5),
+            last_peer_keyframe_req: Instant::now() - Duration::from_secs(5),
         }
     }
 
@@ -487,22 +489,13 @@ impl Worker {
                     }
                     if needs_keyframe {
                         let now = Instant::now();
-                        if runtime.last_keyframe_req.elapsed() >= Duration::from_millis(350) {
+                        if runtime.last_keyframe_req.elapsed() >= Duration::from_millis(1500) {
                             runtime.last_keyframe_req = now;
                             log::info!("[CALL] peer requested keyframe: forcing local IDR keyframe");
                             runtime.call.request_local_keyframe();
                         } else {
-                            log::debug!("[CALL] peer requested keyframe (throttled): skipping duplicate within 350ms");
+                            log::debug!("[CALL] peer requested keyframe (throttled): skipping duplicate within 1500ms");
                         }
-                    }
-                    if matches!(
-                        media,
-                        CallEvent::PeerVideoStateChanged { .. } | CallEvent::VideoStateChanged { .. }
-                    ) {
-                        if let Some(handle) = runtime.call.handle() {
-                            handle.request_peer_keyframe(KeyframeUrgency::Immediate);
-                        }
-                        runtime.call.request_local_keyframe();
                     }
                     runtime.call.media(&media)
                 }
@@ -517,10 +510,14 @@ impl Worker {
     /// One video frame from the current call, straight to the UI.
     pub(super) fn call_frame(&mut self, tick: VideoTick) {
         if matches!(tick, VideoTick::NeedsKeyframe) {
-            if let Some(runtime) = self.call.as_ref()
+            if let Some(runtime) = self.call.as_mut()
                 && let Some(handle) = runtime.call.handle()
             {
-                handle.request_peer_keyframe(KeyframeUrgency::Immediate);
+                if runtime.last_peer_keyframe_req.elapsed() >= Duration::from_millis(1200) {
+                    runtime.last_peer_keyframe_req = Instant::now();
+                    log::info!("[CALL] requesting peer IDR keyframe via RTCP PLI");
+                    handle.request_peer_keyframe(KeyframeUrgency::Immediate);
+                }
             }
             return;
         }

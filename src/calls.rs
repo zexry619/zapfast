@@ -895,17 +895,16 @@ impl VideoPipeline {
 }
 
 /// Baseline video bitrate based on resolution for real-time mobile VoIP.
-/// Baseline video bitrate based on resolution for real-time mobile VoIP.
 pub fn target_bitrate_for_size(width: usize, height: usize) -> u32 {
     let pixels = width * height;
     if pixels >= 1280 * 720 {
-        900_000   // 900 kbps for 720p HD
+        650_000   // 650 kbps for 720p HD
     } else if pixels >= 800 * 600 {
-        650_000   // 650 kbps for SVGA
+        450_000   // 450 kbps for SVGA
     } else if pixels >= 640 * 360 {
-        450_000   // 450 kbps for 360p/VGA (resilient, clear, smooth 30 fps)
+        320_000   // 320 kbps for 360p/VGA (resilient, smooth, fits mobile bandwidth)
     } else {
-        280_000   // 280 kbps for lower resolutions
+        200_000   // 200 kbps for lower resolutions
     }
 }
 
@@ -955,7 +954,7 @@ fn capture(
         .profile(Profile::Baseline)
         .bitrate(BitRate::from_bps(bitrate))
         .max_frame_rate(FrameRate::from_hz(VIDEO_FPS as f32))
-        .intra_frame_period(IntraFramePeriod::from_num_frames(VIDEO_FPS * 2))
+        .intra_frame_period(IntraFramePeriod::from_num_frames(VIDEO_FPS * 15))
         .rate_control_mode(RateControlMode::Bitrate)
         .usage_type(UsageType::CameraVideoRealTime)
         .complexity(Complexity::Low)
@@ -1022,7 +1021,7 @@ fn capture_screen(
         .profile(Profile::Baseline)
         .bitrate(BitRate::from_bps(bitrate))
         .max_frame_rate(FrameRate::from_hz(VIDEO_FPS as f32))
-        .intra_frame_period(IntraFramePeriod::from_num_frames(VIDEO_FPS * 2))
+        .intra_frame_period(IntraFramePeriod::from_num_frames(VIDEO_FPS * 15))
         .rate_control_mode(RateControlMode::Bitrate)
         .usage_type(UsageType::ScreenContentRealTime)
         .complexity(Complexity::Low)
@@ -1380,7 +1379,7 @@ fn decode_remote(
                 in_bytes_acc += frame.data.len() as u64;
                 if !started {
                     if !frame.keyframe {
-                        if last_keyframe_request.elapsed() >= Duration::from_millis(250) {
+                        if last_keyframe_request.elapsed() >= Duration::from_millis(600) {
                             last_keyframe_request = Instant::now();
                             let _ = ticks.try_send(VideoTick::NeedsKeyframe);
                             log::info!("[CALL][REMOTE] requested initial peer keyframe (waiting for IDR)");
@@ -1421,16 +1420,6 @@ fn decode_remote(
                         &raw mut buffer_info,
                     )
                 };
-
-                // If no picture ready immediately, check if a completed picture can be flushed:
-                if buffer_info.iBufferStatus == 0 {
-                    let _ = unsafe {
-                        decoder_ref.raw_api().flush_frame(
-                            std::ptr::from_mut(&mut dst).cast(),
-                            &raw mut buffer_info,
-                        )
-                    };
-                }
 
                 let dec_dur = t_dec_start.elapsed();
                 decode_us_acc += dec_dur.as_micros() as u64;
@@ -1475,15 +1464,23 @@ fn decode_remote(
                 } else {
                     undecodable_in_sec += 1;
                     consecutive_errors += 1;
-                    if state != 0 && last_keyframe_request.elapsed() >= Duration::from_millis(350) {
+                    let is_fatal_decode_err = (state as u32) & (
+                        openh264_sys2::dsRefLost as u32
+                        | openh264_sys2::dsBitstreamError as u32
+                        | openh264_sys2::dsDepLayerLost as u32
+                        | openh264_sys2::dsRefListNullPtrs as u32
+                    ) != 0;
+                    if (is_fatal_decode_err || consecutive_errors >= 15)
+                        && last_keyframe_request.elapsed() >= Duration::from_millis(1500)
+                    {
                         last_keyframe_request = Instant::now();
                         let _ = ticks.try_send(VideoTick::NeedsKeyframe);
                         log::warn!(
-                            "[CALL][REMOTE] missing reference or packet loss (state=0x{state:x}), requested peer keyframe"
+                            "[CALL][REMOTE] missing reference or packet loss (state=0x{state:x}, consecutive_errors={consecutive_errors}), requested peer keyframe"
                         );
                     }
-                    if consecutive_errors >= 30 {
-                        log::warn!("[CALL][REMOTE] 30 consecutive unrenderable frames, resetting decoder instance");
+                    if consecutive_errors >= 45 {
+                        log::warn!("[CALL][REMOTE] 45 consecutive unrenderable frames, resetting decoder instance");
                         decoder = init_remote_decoder();
                         consecutive_errors = 0;
                     }
