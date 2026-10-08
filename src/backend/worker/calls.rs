@@ -56,7 +56,7 @@ impl CallRuntime {
     pub(super) fn new(call: Call, frames: Option<async_channel::Receiver<VideoTick>>) -> Self {
         let (_tx, events) = async_channel::bounded(64);
         let last = call.update();
-        let (base_bitrate, min_bitrate, max_bitrate) = (320_000, 180_000, 600_000);
+        let (base_bitrate, min_bitrate, max_bitrate) = (250_000, 140_000, 450_000);
         Self {
             call,
             events,
@@ -480,7 +480,7 @@ impl Worker {
                         } else if max_loss == 0 && runtime.last_probe_up.elapsed() >= Duration::from_secs(4) {
                             runtime.last_probe_up = now;
                             if runtime.cur_video_bitrate < runtime.max_video_bitrate {
-                                let new_rate = (runtime.cur_video_bitrate + 35_000).min(runtime.max_video_bitrate);
+                                let new_rate = (runtime.cur_video_bitrate + 25_000).min(runtime.max_video_bitrate);
                                 runtime.cur_video_bitrate = new_rate;
                                 runtime.call.set_video_target_bitrate(new_rate);
                                 log::info!("[CALL][BWE] connection clean (0 loss): probed target bitrate to {}kbps", new_rate / 1000);

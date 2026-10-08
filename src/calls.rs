@@ -42,10 +42,10 @@ const PREVIEW_LONG_SIDE: usize = 320;
 const PREVIEW_SHORT_SIDE: usize = 180;
 /// The cadence the camera is asked for and the encoder is built for.
 ///
-/// Thirty frames a second matches native USB camera sensor timing (V4L2 33.3ms intervals).
-/// Frames carry their own monotonic RTP capture timestamps via TimedVideoFrame so playback timing is exact.
-const VIDEO_FPS: u32 = 30;
-/// RTP video clock (90 kHz) divided by the capture cadence (3000 at 30 fps).
+/// Fifteen frames a second matches WhatsApp VoIP reference cadence (VIDEO_TS_STRIDE_15FPS = 6000).
+/// A stable 15 FPS cadence cuts outbound UDP packet flooding in half and prevents buffer bloat on TURN/mobile peers.
+const VIDEO_FPS: u32 = 15;
+/// RTP video clock (90 kHz) divided by the capture cadence (6000 at 15 fps).
 const VIDEO_TS_STRIDE: u32 = 90_000 / VIDEO_FPS;
 
 // ---------------------------------------------------------------------------
@@ -586,7 +586,7 @@ impl CameraCapture {
     fn start(
         device: Option<String>,
         ticks: async_channel::Sender<VideoTick>,
-        timed: async_channel::Sender<TimedVideoFrame>,
+        frames: async_channel::Sender<Vec<u8>>,
     ) -> Result<Self> {
         // Refuse a camera that cannot be opened before any signaling, rather than spawning a
         // thread that exits and sends a video call with no local picture: `capture` treats a
@@ -614,7 +614,7 @@ impl CameraCapture {
             .name("zapfast-camera".to_owned())
             .spawn(move || {
                 let _alive = alive;
-                capture(Some(device), timed, ticks, slot, stopping, keyframing, bitrates, ready);
+                capture(Some(device), frames, ticks, slot, stopping, keyframing, bitrates, ready);
             })
             .context("camera thread could not be started")?;
         match came_up.recv_timeout(CAMERA_STARTUP) {
@@ -642,7 +642,7 @@ impl CameraCapture {
 
     fn start_screen(
         ticks: async_channel::Sender<VideoTick>,
-        timed: async_channel::Sender<TimedVideoFrame>,
+        frames: async_channel::Sender<Vec<u8>>,
     ) -> Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let force_keyframe = Arc::new(AtomicBool::new(true));
@@ -658,7 +658,7 @@ impl CameraCapture {
             .name("zapfast-screenshare".to_owned())
             .spawn(move || {
                 let _alive = alive;
-                capture_screen(timed, ticks, slot, stopping, keyframing, bitrates, ready);
+                capture_screen(frames, ticks, slot, stopping, keyframing, bitrates, ready);
             })
             .context("screenshare thread could not be started")?;
         match came_up.recv_timeout(CAMERA_STARTUP) {
@@ -743,17 +743,16 @@ impl Drop for CaptureAlive {
 
 /// The `VideoSource` the engine pulls access units from.
 struct LocalVideoSource {
-    timed: async_channel::Receiver<TimedVideoFrame>,
-    empty: async_channel::Receiver<Vec<u8>>,
+    frames: async_channel::Receiver<Vec<u8>>,
 }
 
 impl VideoSource for LocalVideoSource {
     fn frames(&self) -> async_channel::Receiver<Vec<u8>> {
-        self.empty.clone()
+        self.frames.clone()
     }
 
     fn timed_frames(&self) -> Option<async_channel::Receiver<TimedVideoFrame>> {
-        Some(self.timed.clone())
+        None
     }
 
     fn rtp_timestamp_stride(&self) -> u32 {
@@ -776,9 +775,8 @@ impl VideoSink for RemoteVideoSink {
 pub struct VideoPipeline {
     ticks: async_channel::Sender<VideoTick>,
     remote_tx: async_channel::Sender<VideoFrame>,
-    timed_tx: async_channel::Sender<TimedVideoFrame>,
-    timed_rx: async_channel::Receiver<TimedVideoFrame>,
-    empty_rx: async_channel::Receiver<Vec<u8>>,
+    frames_tx: async_channel::Sender<Vec<u8>>,
+    frames_rx: async_channel::Receiver<Vec<u8>>,
     camera: Option<CameraCapture>,
     device: Option<String>,
     is_screen_sharing: bool,
@@ -790,17 +788,15 @@ impl VideoPipeline {
     pub fn start(device: Option<String>) -> Result<(Self, async_channel::Receiver<VideoTick>)> {
         let (ticks, tick_rx) = async_channel::bounded::<VideoTick>(32);
         let (remote_tx, remote_rx) = async_channel::bounded::<VideoFrame>(32);
-        let (timed_tx, timed_rx) = async_channel::bounded::<TimedVideoFrame>(64);
-        let (_empty_tx, empty_rx) = async_channel::bounded::<Vec<u8>>(1);
+        let (frames_tx, frames_rx) = async_channel::bounded::<Vec<u8>>(32);
         decode_remote(remote_rx, ticks.clone());
-        let camera = CameraCapture::start(device.clone(), ticks.clone(), timed_tx.clone())?;
+        let camera = CameraCapture::start(device.clone(), ticks.clone(), frames_tx.clone())?;
         Ok((
             Self {
                 ticks,
                 remote_tx,
-                timed_tx,
-                timed_rx,
-                empty_rx,
+                frames_tx,
+                frames_rx,
                 camera: Some(camera),
                 device,
                 is_screen_sharing: false,
@@ -811,8 +807,7 @@ impl VideoPipeline {
 
     fn source(&self) -> LocalVideoSource {
         LocalVideoSource {
-            timed: self.timed_rx.clone(),
-            empty: self.empty_rx.clone(),
+            frames: self.frames_rx.clone(),
         }
     }
 
@@ -836,7 +831,7 @@ impl VideoPipeline {
         }
         self.device = device.clone();
         self.is_screen_sharing = false;
-        self.camera = Some(CameraCapture::start(device, self.ticks.clone(), self.timed_tx.clone())?);
+        self.camera = Some(CameraCapture::start(device, self.ticks.clone(), self.frames_tx.clone())?);
         Ok(())
     }
 
@@ -850,11 +845,11 @@ impl VideoPipeline {
         }
         if on {
             log::info!("[CALL] switching local video stream to Screen Share");
-            self.camera = Some(CameraCapture::start_screen(self.ticks.clone(), self.timed_tx.clone())?);
+            self.camera = Some(CameraCapture::start_screen(self.ticks.clone(), self.frames_tx.clone())?);
             self.is_screen_sharing = true;
         } else {
             log::info!("[CALL] switching local video stream to Camera ({:?})", self.device);
-            self.camera = Some(CameraCapture::start(self.device.clone(), self.ticks.clone(), self.timed_tx.clone())?);
+            self.camera = Some(CameraCapture::start(self.device.clone(), self.ticks.clone(), self.frames_tx.clone())?);
             self.is_screen_sharing = false;
         }
         self.request_keyframe();
@@ -898,13 +893,13 @@ impl VideoPipeline {
 pub fn target_bitrate_for_size(width: usize, height: usize) -> u32 {
     let pixels = width * height;
     if pixels >= 1280 * 720 {
-        650_000   // 650 kbps for 720p HD
+        450_000   // 450 kbps for 720p HD (fits mobile bandwidth without congestion)
     } else if pixels >= 800 * 600 {
-        450_000   // 450 kbps for SVGA
+        350_000   // 350 kbps for SVGA
     } else if pixels >= 640 * 360 {
-        320_000   // 320 kbps for 360p/VGA (resilient, smooth, fits mobile bandwidth)
+        250_000   // 250 kbps for 360p/VGA (resilient, smooth, fits mobile bandwidth)
     } else {
-        200_000   // 200 kbps for lower resolutions
+        160_000   // 160 kbps for lower resolutions
     }
 }
 
@@ -915,7 +910,7 @@ pub fn target_bitrate_for_size(width: usize, height: usize) -> u32 {
 /// stalled consumer drops a frame instead of stalling the camera.
 fn capture(
     device: Option<String>,
-    timed: async_channel::Sender<TimedVideoFrame>,
+    frames: async_channel::Sender<Vec<u8>>,
     ticks: async_channel::Sender<VideoTick>,
     child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
     stopping: Arc<AtomicBool>,
@@ -981,7 +976,7 @@ fn capture(
         &stopping,
         &force_keyframe,
         &target_bitrate,
-        &timed,
+        &frames,
         &ticks,
         &mut encoder,
     );
@@ -992,7 +987,7 @@ fn capture(
 
 /// Captures from desktop screen, encodes each frame using screen content profile, and feeds the preview and peer stream.
 fn capture_screen(
-    timed: async_channel::Sender<TimedVideoFrame>,
+    frames: async_channel::Sender<Vec<u8>>,
     ticks: async_channel::Sender<VideoTick>,
     child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
     stopping: Arc<AtomicBool>,
@@ -1015,7 +1010,7 @@ fn capture_screen(
         }
     };
     let size = source.size();
-    let bitrate = 800_000;
+    let bitrate = 500_000;
     target_bitrate.store(bitrate, Ordering::Relaxed);
     let config = EncoderConfig::new()
         .profile(Profile::Baseline)
@@ -1046,7 +1041,7 @@ fn capture_screen(
         &stopping,
         &force_keyframe,
         &target_bitrate,
-        &timed,
+        &frames,
         &ticks,
         &mut encoder,
     );
@@ -1103,7 +1098,7 @@ fn capture_frames(
     stopping: &AtomicBool,
     force_keyframe: &AtomicBool,
     target_bitrate: &AtomicU32,
-    timed: &async_channel::Sender<TimedVideoFrame>,
+    frames: &async_channel::Sender<Vec<u8>>,
     ticks: &async_channel::Sender<VideoTick>,
     encoder: &mut openh264::encoder::Encoder,
 ) {
@@ -1119,8 +1114,9 @@ fn capture_frames(
     let mut drops_in_sec: u32 = 0;
     let mut au_bytes_acc: u64 = 0;
 
-    // Monotonic start timer for 90 kHz RTP capture timestamps:
-    let started = Instant::now();
+    // Minimum interval between encoded outbound frames to maintain steady 15 FPS cadence on the wire:
+    let min_frame_interval = Duration::from_millis(1000 / VIDEO_FPS as u64 - 5);
+    let mut last_send_time = Instant::now() - min_frame_interval;
 
     // Cache latest SPS and PPS NALs to guarantee every IDR keyframe has repeated headers:
     let mut cached_sps: Option<Vec<u8>> = None;
@@ -1156,6 +1152,38 @@ fn capture_frames(
             log::warn!("[CALL][CAM] slow camera read: took {}ms", read_dur.as_millis());
         }
 
+        let luma = &bytes[..luma_len];
+        let chroma_u = &bytes[luma_len..luma_len + chroma_len];
+        let chroma_v = &bytes[luma_len + chroma_len..];
+
+        // Always update local preview for smooth UI:
+        let t_conv_start = Instant::now();
+        let image = crate::video::rgb_image(
+            luma,
+            chroma_u,
+            chroma_v,
+            (width, width / 2, width / 2),
+            (width, height),
+            preview_size(size),
+            // Our own frames arrive upright from the camera: there is no rotation to undo, and
+            // none is announced either.
+            0,
+        );
+        let _ = ticks.try_send(VideoTick::Local(Arc::new(image)));
+        let conv_dur = t_conv_start.elapsed();
+        conv_us_acc += conv_dur.as_micros() as u64;
+
+        // Software frame pacing:
+        // Webcams often capture at 30+ FPS. If we send all frames to the network, we overwhelm
+        // the 15 FPS negotiated RTP channel, TURN relay, and peer jitter buffer.
+        let is_force_key = force_keyframe.swap(false, Ordering::Relaxed);
+        let is_due = last_send_time.elapsed() >= min_frame_interval;
+        if !is_due && !is_force_key {
+            continue;
+        }
+        last_send_time = Instant::now();
+
+        // Handle dynamic bitrate adjustment from BWE:
         let desired_bitrate = target_bitrate.load(Ordering::Relaxed);
         if desired_bitrate != current_bitrate && desired_bitrate > 0 {
             let mut info = openh264_sys2::SBitrateInfo {
@@ -1178,9 +1206,6 @@ fn capture_frames(
             }
         }
 
-        let luma = &bytes[..luma_len];
-        let chroma_u = &bytes[luma_len..luma_len + chroma_len];
-        let chroma_v = &bytes[luma_len + chroma_len..];
         let planes = Yuv420 {
             y: luma,
             u: chroma_u,
@@ -1188,7 +1213,7 @@ fn capture_frames(
             size,
         };
 
-        if force_keyframe.swap(false, Ordering::Relaxed) {
+        if is_force_key {
             encoder.force_intra_frame();
             log::info!("[CALL][CAM] forced IDR keyframe");
         }
@@ -1248,10 +1273,7 @@ fn capture_frames(
 
                 // Only send to the network if actual video NAL slices were encoded (more than just AUD header):
                 if unit.len() > 6 {
-                    let elapsed = started.elapsed().as_micros() as u64;
-                    let timestamp = (elapsed * 90 / 1000) as u32;
-                    let frame = TimedVideoFrame::builder().data(unit).timestamp(timestamp).build();
-                    if timed.try_send(frame).is_err() {
+                    if frames.try_send(unit).is_err() {
                         drops_in_sec += 1;
                         log::warn!("[CALL][CAM] outbound video channel full: frame dropped");
                     }
@@ -1264,22 +1286,6 @@ fn capture_frames(
         if enc_dur.as_millis() > 30 {
             log::warn!("[CALL][CAM] slow h264 encode: took {}ms", enc_dur.as_millis());
         }
-
-        let t_conv_start = Instant::now();
-        let image = crate::video::rgb_image(
-            luma,
-            chroma_u,
-            chroma_v,
-            (width, width / 2, width / 2),
-            (width, height),
-            preview_size(size),
-            // Our own frames arrive upright from the camera: there is no rotation to undo, and
-            // none is announced either.
-            0,
-        );
-        let _ = ticks.try_send(VideoTick::Local(Arc::new(image)));
-        let conv_dur = t_conv_start.elapsed();
-        conv_us_acc += conv_dur.as_micros() as u64;
 
         frames_in_sec += 1;
         if sec_timer.elapsed() >= Duration::from_secs(1) {
@@ -1335,7 +1341,12 @@ impl openh264::formats::YUVSource for Yuv420<'_> {
 
 /// Helper to initialize an OpenH264 decoder with error concealment enabled.
 fn init_remote_decoder() -> Option<openh264::decoder::Decoder> {
-    let mut decoder = openh264::decoder::Decoder::new().ok()?;
+    let mut decoder = openh264::decoder::Decoder::with_api_config(
+        openh264::OpenH264API::from_source(),
+        openh264::decoder::DecoderConfig::new()
+            .flush_after_decode(openh264::decoder::Flush::NoFlush),
+    )
+    .ok()?;
     unsafe {
         let mut ec = openh264_sys2::ERROR_CON_SLICE_COPY as i32;
         let _ = decoder.raw_api().set_option(
@@ -1410,79 +1421,58 @@ fn decode_remote(
                 let turns = crate::video::orientation_turns(orientation);
 
                 let t_dec_start = Instant::now();
-                let mut dst = [std::ptr::null_mut::<u8>(); 3];
-                let mut buffer_info = openh264_sys2::SBufferInfo::default();
-                let state = unsafe {
-                    decoder_ref.raw_api().decode_frame_no_delay(
-                        frame.data.as_ptr(),
-                        frame.data.len() as std::os::raw::c_int,
-                        std::ptr::from_mut(&mut dst).cast(),
-                        &raw mut buffer_info,
-                    )
-                };
-
+                let decoded_res = decoder_ref.decode(&frame.data);
                 let dec_dur = t_dec_start.elapsed();
                 decode_us_acc += dec_dur.as_micros() as u64;
 
-                if buffer_info.iBufferStatus == 1
-                    && !dst[0].is_null()
-                    && !dst[1].is_null()
-                    && !dst[2].is_null()
-                {
-                    let sys = unsafe { buffer_info.UsrData.sSystemBuffer };
-                    let width = sys.iWidth as usize;
-                    let height = sys.iHeight as usize;
-                    let y_stride = sys.iStride[0] as usize;
-                    let uv_stride = sys.iStride[1] as usize;
+                match decoded_res {
+                    Ok(Some(decoded)) => {
+                        use openh264::formats::YUVSource;
+                        let (width, height) = decoded.dimensions();
+                        let (y_stride, u_stride, v_stride) = decoded.strides();
 
-                    if width > 0 && height > 0 && y_stride >= width && uv_stride >= width / 2 {
-                        cur_size = (width, height);
-                        let t_conv_start = Instant::now();
-                        let y = unsafe { std::slice::from_raw_parts(dst[0], height * y_stride) };
-                        let u = unsafe { std::slice::from_raw_parts(dst[1], (height / 2) * uv_stride) };
-                        let v = unsafe { std::slice::from_raw_parts(dst[2], (height / 2) * uv_stride) };
+                        if width > 0 && height > 0 && y_stride >= width && u_stride >= width / 2 && v_stride >= width / 2 {
+                            cur_size = (width, height);
+                            let t_conv_start = Instant::now();
+                            let image = crate::video::rgb_image(
+                                decoded.y(),
+                                decoded.u(),
+                                decoded.v(),
+                                (y_stride, u_stride, v_stride),
+                                (width, height),
+                                (width, height),
+                                turns,
+                            );
+                            conv_us_acc += t_conv_start.elapsed().as_micros() as u64;
 
-                        let image = crate::video::rgb_image(
-                            y,
-                            u,
-                            v,
-                            (y_stride, uv_stride, uv_stride),
-                            (width, height),
-                            (width, height),
-                            turns,
-                        );
-                        let conv_dur = t_conv_start.elapsed();
-                        conv_us_acc += conv_dur.as_micros() as u64;
-
-                        let image = Arc::new(image);
-                        if ticks.try_send(VideoTick::Remote(image)).is_err() {
-                            ticks_dropped += 1;
+                            let image = Arc::new(image);
+                            if ticks.try_send(VideoTick::Remote(image)).is_err() {
+                                ticks_dropped += 1;
+                            }
+                            frames_in_sec += 1;
+                            consecutive_errors = 0;
                         }
-                        frames_in_sec += 1;
-                        consecutive_errors = 0;
                     }
-                } else {
-                    undecodable_in_sec += 1;
-                    consecutive_errors += 1;
-                    let is_fatal_decode_err = (state as u32) & (
-                        openh264_sys2::dsRefLost as u32
-                        | openh264_sys2::dsBitstreamError as u32
-                        | openh264_sys2::dsDepLayerLost as u32
-                        | openh264_sys2::dsRefListNullPtrs as u32
-                    ) != 0;
-                    if (is_fatal_decode_err || consecutive_errors >= 15)
-                        && last_keyframe_request.elapsed() >= Duration::from_millis(1500)
-                    {
-                        last_keyframe_request = Instant::now();
-                        let _ = ticks.try_send(VideoTick::NeedsKeyframe);
-                        log::warn!(
-                            "[CALL][REMOTE] missing reference or packet loss (state=0x{state:x}, consecutive_errors={consecutive_errors}), requested peer keyframe"
-                        );
+                    Ok(None) => {
+                        // NAL without decoded picture (e.g. SPS/PPS parameter set or partial slice)
                     }
-                    if consecutive_errors >= 45 {
-                        log::warn!("[CALL][REMOTE] 45 consecutive unrenderable frames, resetting decoder instance");
-                        decoder = init_remote_decoder();
-                        consecutive_errors = 0;
+                    Err(err) => {
+                        undecodable_in_sec += 1;
+                        consecutive_errors += 1;
+                        if (consecutive_errors >= 10)
+                            && last_keyframe_request.elapsed() >= Duration::from_millis(1500)
+                        {
+                            last_keyframe_request = Instant::now();
+                            let _ = ticks.try_send(VideoTick::NeedsKeyframe);
+                            log::warn!(
+                                "[CALL][REMOTE] decode error ({err:?}, consecutive={consecutive_errors}), requested peer keyframe"
+                            );
+                        }
+                        if consecutive_errors >= 45 {
+                            log::warn!("[CALL][REMOTE] 45 consecutive unrenderable frames, resetting decoder instance");
+                            decoder = init_remote_decoder();
+                            consecutive_errors = 0;
+                        }
                     }
                 }
 
@@ -2778,14 +2768,12 @@ mod tests {
     fn pipeline_with_a_running_camera() -> VideoPipeline {
         let (ticks, _ticks_rx) = async_channel::bounded::<VideoTick>(2);
         let (remote_tx, _remote_rx) = async_channel::bounded::<VideoFrame>(8);
-        let (timed_tx, timed_rx) = async_channel::bounded::<TimedVideoFrame>(16);
-        let (_empty_tx, empty_rx) = async_channel::bounded::<Vec<u8>>(1);
+        let (frames_tx, frames_rx) = async_channel::bounded::<Vec<u8>>(16);
         VideoPipeline {
             ticks,
             remote_tx,
-            timed_tx,
-            timed_rx,
-            empty_rx,
+            frames_tx,
+            frames_rx,
             camera: Some(CameraCapture {
                 running: Arc::new(AtomicBool::new(true)),
                 force_keyframe: Arc::new(AtomicBool::new(false)),
