@@ -28,6 +28,12 @@ Written in pure Rust with [egui](https://github.com/emilk/egui) and [whatsapp-ru
 | ⏳ **Disappearing Messages** | Manage ephemeral message timers (24 hours, 7 days, 90 days) per chat. |
 | 🎨 **Modern WhatsApp Web UI** | Refined sidebar rail navigation, toggle panels, accurate unread badge count, and fixed system tray. |
 
+Plus latest upstream additions: open chats from links/URIs (`whatsapp:`), phone numbers in message text open actions to start a chat, and message info shortcut.
+
+**Want Spotify just as fast and native?** [Spotifast](https://spotifast.rocks)
+is ZapFast's sibling. Both are built on
+[fastframe](https://github.com/crmne/fastframe).
+
 ---
 
 ## 💻 Cross-Platform Support
@@ -78,7 +84,8 @@ OPENSSL_NO_VENDOR=1 cargo build --release --bin zapfast
 
 For offline demo mode (inspect UI layouts without logging in):
 ```sh
-cargo run --features demo -- --demo
+cargo run --features demo -- --demo            # offline sample chats, no WhatsApp connection
+cargo run --features demo -- --demo-page phone-menu
 ```
 
 ---

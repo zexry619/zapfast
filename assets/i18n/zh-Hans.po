@@ -16,6 +16,14 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=1; plural=0;\n"
 
+#: src/ui/conversation.rs:5525
+msgid "Message"
+msgstr "发送消息"
+
+#: src/ui/conversation.rs:5526
+msgid "Copy number"
+msgstr "复制号码"
+
 #: src/model.rs:113
 msgid "All"
 msgstr "全部"

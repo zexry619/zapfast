@@ -375,6 +375,17 @@ impl Downloadable for PhoneSticker {
     }
 }
 
+/// The device name shown in WhatsApp's Linked Devices list, with the
+/// hostname appended so multiple machines can be told apart (#210).
+fn device_name() -> String {
+    let host = crate::util::hostname();
+    if host.is_empty() {
+        "ZapFast".to_owned()
+    } else {
+        format!("ZapFast ({host})")
+    }
+}
+
 /// App version in WhatsApp device-property format.
 fn app_version() -> wa::device_props::AppVersion {
     let mut parts = env!("CARGO_PKG_VERSION")
@@ -560,6 +571,7 @@ pub async fn run(
     worker.backfill();
     worker.backfill_video_notes();
     worker.backfill_view_once();
+    worker.backfill_motion_photos();
     worker.backfill_interactive();
     worker.relocate_media();
     discard_attachment_staging(&worker.dirs.media_cache_dir());
@@ -1002,6 +1014,15 @@ struct ParsedChat {
     revoked: Vec<String>,
     poll_updates: Vec<HistoryPollUpdate>,
     reactions: Vec<HistoryReaction>,
+    clips: Vec<HistoryClip>,
+}
+
+/// A motion photo's clip from history, filed for its photo.
+struct HistoryClip {
+    parent: String,
+    sender: Option<String>,
+    from_me: bool,
+    raw: Vec<u8>,
 }
 
 /// Counts only. Never put message keys, bodies, names, or raw protobufs here:
@@ -1437,6 +1458,12 @@ impl Worker {
                 return;
             }
         };
+        // A clip lives only in the cache: one that is gone downloads again.
+        for (chat, id, path) in self.archive.motion_paths().unwrap_or_default() {
+            if !path.exists() {
+                let _ = self.archive.put_motion_path(&chat, &id, None);
+            }
+        }
         let (mut moved, mut forgotten) = (0, 0);
         for (chat, id, card, path) in rows {
             if path.exists() {
@@ -1631,6 +1658,61 @@ impl Worker {
         }
     }
 
+    /// Moves the clips of motion photos, filed as unsupported messages before
+    /// they were recognised, to their photos.
+    fn backfill_motion_photos(&mut self) {
+        const KEY: &str = "motion_photo_children";
+        if self.archive.meta(KEY).ok().flatten().as_deref() == Some("1") {
+            return;
+        }
+        let rows = match self.archive.unsupported_with_raw() {
+            Ok(rows) => rows,
+            Err(error) => {
+                log::warn!("could not read archived unsupported messages: {error}");
+                return;
+            }
+        };
+        let mut removed = 0;
+        let mut failed = false;
+        for (chat, id, raw) in rows {
+            let Ok(message) = wa::Message::decode_from_slice(&raw) else {
+                continue;
+            };
+            let base = message.get_base_message();
+            if !motion_photo_child(base) {
+                continue;
+            }
+            if let Some((parent, clip)) = motion_clip(base) {
+                let filed = self.archive.message(&chat, &id).and_then(|row| match row {
+                    Some(row) => self
+                        .archive
+                        .put_motion_clip(&chat, &parent, &row.sender, &clip)
+                        .map(drop),
+                    None => Ok(()),
+                });
+                if let Err(error) = filed {
+                    log::warn!("could not move an archived motion clip: {error}");
+                    failed = true;
+                    continue;
+                }
+            }
+            match self.archive.delete_message(&chat, &id) {
+                Ok(_) => removed += 1,
+                Err(error) => {
+                    log::warn!("could not remove an archived motion clip: {error}");
+                    failed = true;
+                }
+            }
+        }
+        if !failed {
+            let _ = self.archive.set_meta(KEY, "1");
+        }
+        if removed > 0 {
+            log::info!("removed {removed} archived motion photo clips");
+            self.emit_chats();
+        }
+    }
+
     async fn start_bot(&mut self) {
         let path = self.dirs.session_db();
         if let Some(parent) = path.parent() {
@@ -1668,7 +1750,7 @@ impl Worker {
             // WhatsApp reads the linked-device name, version, and icon at pairing.
             .with_device_props(
                 DevicePropsOverride::new()
-                    .with_os("ZapFast")
+                    .with_os(device_name())
                     .with_version(app_version())
                     .with_platform_type(wa::device_props::PlatformType::DESKTOP),
             )
@@ -3690,6 +3772,10 @@ impl Worker {
         if self.update_live_location(&chat, &sender, base, info) {
             return;
         }
+        if let Some((parent, clip)) = motion_clip(base) {
+            self.file_motion_clip(&chat, &parent, &sender, &clip);
+            return;
+        }
         let Some(mut content) = classify(message) else {
             return;
         };
@@ -3697,7 +3783,7 @@ impl Worker {
             && info.media_type == Some(EncMediaType::LiveLocation)
         {
             *live_location = true;
-            if self.continues_masked_live_location(&chat, &sender, &info.id, info) {
+            if self.absorb_masked_live_location(&chat, &sender, &info.id, info) {
                 return;
             }
         }
@@ -3806,14 +3892,21 @@ impl Worker {
 
     /// Whether a masked live location only continues the share `sender`
     /// last posted in this chat. Linked devices cannot follow the position,
-    /// so a share keeps the one bubble it started with.
-    fn continues_masked_live_location(
-        &self,
+    /// so a share keeps the one bubble it started with: the card it already
+    /// shows keeps its last position and says the newer ones are on the
+    /// phone, and a share this device was never able to read keeps its
+    /// single placeholder.
+    fn absorb_masked_live_location(
+        &mut self,
         chat: &str,
         sender: &str,
         id: &str,
         info: &MessageInfo,
     ) -> bool {
+        let now = info.timestamp.timestamp();
+        if self.mark_share_on_the_phone(chat, sender, now) {
+            return true;
+        }
         let Ok(Some(latest)) = self.archive.latest_id_from(chat, sender) else {
             return false;
         };
@@ -3833,6 +3926,41 @@ impl Worker {
                     }
                 ) && info.timestamp.timestamp() - message.timestamp <= LIVE_LOCATION_LIMIT
             })
+    }
+
+    /// Whether the sender's share in this chat is a card, marking it as the
+    /// one that cannot follow the phone's newer positions, and whether the
+    /// position that arrived belongs to it. That card is the share's whole
+    /// row, so it owns the fact instead of the chat growing a second bubble.
+    fn mark_share_on_the_phone(&mut self, chat: &str, sender: &str, now: i64) -> bool {
+        let since = now - LIVE_LOCATION_LIMIT;
+        let Ok(Some(latest)) = self.archive.unique_live_location(chat, sender, since) else {
+            return false;
+        };
+        let Ok(Some(mut share)) = self.archive.message(chat, &latest) else {
+            return false;
+        };
+        // The share's newest position may be newer than this event: a masked
+        // event that arrives out of order says nothing about positions the
+        // card already shows, so it must not claim the phone holds them.
+        if live_location_time(&share) > now {
+            return false;
+        }
+        if share.content.live_location_over(share.timestamp, now) {
+            return false;
+        }
+        let Content::LiveLocation { newer_on_phone, .. } = &mut share.content else {
+            return false;
+        };
+        if *newer_on_phone {
+            return true;
+        }
+        *newer_on_phone = true;
+        if let Err(error) = self.archive.insert_message(&share, None) {
+            log::warn!("could not store a live location position notice: {error}");
+        }
+        self.emit_message(chat, &latest);
+        true
     }
 
     /// The stored live location that a position from `sender` updates: the
@@ -4113,7 +4241,7 @@ impl Worker {
             self.canonical(&info.source.sender)
         };
         let live_location = info.media_type == Some(EncMediaType::LiveLocation);
-        if live_location && self.continues_masked_live_location(&chat, &sender, &info.id, info) {
+        if live_location && self.absorb_masked_live_location(&chat, &sender, &info.id, info) {
             return;
         }
         let row = Message {
@@ -4214,6 +4342,7 @@ impl Worker {
         // that has no downloaded path.
         if let Some(existing) = &existing {
             message.content.keep_local_paths(&existing.content);
+            keep_live_location_notice(&mut message.content, existing);
         }
         if let Err(error) = self.archive.insert_message(&message, raw.as_deref()) {
             log::warn!("could not store a message: {error}");
@@ -4710,20 +4839,26 @@ impl Worker {
                 // archive already holds; keep the files it already downloaded.
                 let mut keep_raw = false;
                 let mut existed = false;
+                let mut live_location_changed = false;
                 if let Ok(Some(existing)) = self.archive.message(&id, &row.id) {
                     existed = true;
                     row.content.keep_local_paths(&existing.content);
+                    keep_live_location_notice(&mut row.content, &existing);
                     // A repeated original must not undo a later edit or revoke.
                     if (existing.edited && !row.edited)
                         || matches!(existing.content, Content::Revoked)
                     {
-                        row.content = existing.content;
+                        row.content = existing.content.clone();
                         row.edited = existing.edited;
                         row.quoted = existing.quoted;
                         row.mentions = existing.mentions;
-                        row.thumbnail = existing.thumbnail;
+                        row.thumbnail = existing.thumbnail.clone();
                         keep_raw = true;
                     }
+                    live_location_changed = matches!(
+                        (&existing.content, &row.content),
+                        (Content::LiveLocation { .. }, Content::LiveLocation { .. })
+                    ) && existing.content != row.content;
                 }
                 if let Err(error) = self
                     .archive
@@ -4731,10 +4866,15 @@ impl Worker {
                 {
                     failed += 1;
                     log::warn!("could not store a history message: {error}");
-                } else if existed {
-                    repeated += 1;
                 } else {
-                    added += 1;
+                    if live_location_changed {
+                        self.emit_message(&id, &row.id);
+                    }
+                    if existed {
+                        repeated += 1;
+                    } else {
+                        added += 1;
+                    }
                 }
                 self.settle_early_events(&id, &row.id);
                 if group {
@@ -4775,6 +4915,17 @@ impl Worker {
                 let _ = self
                     .archive
                     .set_content(&id, &revoked, &Content::Revoked, false);
+            }
+            for clip in chat.clips {
+                let sender = if clip.from_me {
+                    self.me()
+                } else {
+                    clip.sender
+                        .as_deref()
+                        .map(|sender| self.canonical_str(sender))
+                        .unwrap_or_else(|| id.clone())
+                };
+                self.file_motion_clip(&id, &clip.parent, &sender, &clip.raw);
             }
             if (metadata || existing.is_none())
                 && let Some(snapshot_unread) = chat.unread
@@ -6300,6 +6451,19 @@ impl Worker {
                 id,
                 result,
             } => self.downloaded(chat, id, card, result),
+            Command::DownloadMotion { chat, message } => self.download_motion(chat, message),
+            Command::MotionDownloaded { chat, id, result } => {
+                if let Ok(path) = &result
+                    && let Err(error) = self.archive.put_motion_path(&chat, &id, Some(path))
+                {
+                    log::warn!("could not store a motion clip's path: {error}");
+                }
+                self.emit(Event::Motion {
+                    chat,
+                    message: id,
+                    result,
+                });
+            }
             Command::AvatarFetched { id, full, path } => {
                 self.emit(Event::Avatar { id, full, path })
             }
@@ -7958,6 +8122,53 @@ impl Worker {
         });
     }
 
+    /// Keeps a motion photo's clip for its photo, which may not be here yet.
+    fn file_motion_clip(&mut self, chat: &str, parent: &str, sender: &str, clip: &[u8]) {
+        match self.archive.put_motion_clip(chat, parent, sender, clip) {
+            Ok(true) => self.emit_message(chat, parent),
+            Ok(false) => {}
+            Err(error) => log::warn!("could not store a motion clip: {error}"),
+        }
+    }
+
+    /// Downloads a motion photo's clip into the cache. It is fetched like any
+    /// attachment: verified, under the size limit, and within the deadline.
+    fn download_motion(&mut self, chat: ChatId, id: String) {
+        let clip = self.archive.motion_clip(&chat, &id).ok().flatten();
+        let video = clip
+            .and_then(|raw| wa::Message::decode_from_slice(&raw).ok())
+            .and_then(|message| message.video_message.into_option());
+        let (client, video) = match (self.client.clone(), video) {
+            (Some(client), Some(video)) if !attachment_is_too_large(video.file_length) => {
+                (client, video)
+            }
+            (client, video) => {
+                let error = match (client, video) {
+                    (None, _) => "Not connected to WhatsApp",
+                    (_, None) => "The clip has not arrived",
+                    _ => ATTACHMENT_LIMIT_ERROR,
+                };
+                self.emit(Event::Motion {
+                    chat,
+                    message: id,
+                    result: Err(error.to_owned()),
+                });
+                return;
+            }
+        };
+        let dir = self.dirs.media_cache_dir();
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let path = media_path(&dir, &chat, &format!("{id}-motion"), "video/mp4", None);
+            let result = with_attachment_deadline(
+                ATTACHMENT_TIMEOUT,
+                download_attachment(&client, &video, &dir, &path),
+            )
+            .await;
+            let _ = commands.send(Command::MotionDownloaded { chat, id, result });
+        });
+    }
+
     /// Files the result and releases any picker request that started it.
     fn downloaded(
         &mut self,
@@ -9327,6 +9538,7 @@ fn live_location_of(base: &wa::Message) -> Option<(Content, Option<String>)> {
                 sequence: 0,
                 ended: false,
                 updated: 0,
+                newer_on_phone: false,
             },
             None,
         ));
@@ -9344,7 +9556,33 @@ fn live_location_content(live: &wa::message::LiveLocationMessage, ended: bool) -
         sequence: live.sequence_number.unwrap_or(0),
         ended,
         updated: 0,
+        newer_on_phone: false,
     }
+}
+
+/// Carries a stored live location's notice about the positions the phone
+/// keeps to itself into a replayed classification of the same message. A
+/// replay brings no newer readable position, so the notice stands; only an
+/// advancing position or a share the phone reports as finished takes it back.
+fn keep_live_location_notice(incoming: &mut Content, existing: &Message) {
+    if !matches!(incoming, Content::LiveLocation { .. }) {
+        return;
+    }
+    let stored = matches!(
+        existing.content,
+        Content::LiveLocation {
+            newer_on_phone: true,
+            ..
+        }
+    );
+    // `live_location_newer` needs the share, so decide before borrowing the
+    // incoming content's own fields.
+    let advances = live_location_newer(existing, incoming);
+    let ended = matches!(incoming, Content::LiveLocation { ended: true, .. });
+    let Content::LiveLocation { newer_on_phone, .. } = incoming else {
+        return;
+    };
+    *newer_on_phone = stored && !advances && !ended;
 }
 
 /// The last position of a share that history reports as finished.
@@ -9447,7 +9685,13 @@ fn classify_base(base: &wa::Message) -> Option<Content> {
         });
     }
     if let Some(image) = base.image_message.as_option() {
+        let parent = image
+            .context_info
+            .as_option()
+            .and_then(|context| context.paired_media_type)
+            == Some(wa::context_info::PairedMediaType::MOTION_PHOTO_PARENT);
         return Some(Content::Image {
+            motion: parent.then(Default::default),
             caption: non_empty(&image.caption),
             media: media(
                 image.mimetype.as_ref(),
@@ -9574,7 +9818,7 @@ fn classify_base(base: &wa::Message) -> Option<Content> {
             what: what.to_owned(),
         })
     };
-    if base.album_message.is_set() {
+    if base.album_message.is_set() || motion_photo_child(base) {
         return None;
     }
     if base.group_invite_message.is_set() {
@@ -9645,6 +9889,67 @@ fn classify_base(base: &wa::Message) -> Option<Content> {
         return None;
     }
     unsupported("message")
+}
+
+/// Whether `base` carries the video half of a motion photo. The photo is a
+/// message of its own, so the clip beside it is not a second message.
+fn motion_photo_child(base: &wa::Message) -> bool {
+    use wa::context_info::PairedMediaType;
+    use wa::message_association::AssociationType;
+    let Some(child) = base
+        .associated_child_message
+        .as_option()
+        .and_then(|wrapper| wrapper.message.as_option())
+    else {
+        return false;
+    };
+    let associated = |message: &wa::Message| {
+        message
+            .message_context_info
+            .as_option()
+            .and_then(|context| context.message_association.as_option())
+            .and_then(|association| association.association_type)
+            == Some(AssociationType::MOTION_PHOTO)
+    };
+    associated(base)
+        || associated(child)
+        || child
+            .video_message
+            .as_option()
+            .and_then(|video| video.context_info.as_option())
+            .and_then(|context| context.paired_media_type)
+            == Some(PairedMediaType::MOTION_PHOTO_CHILD)
+}
+
+/// The id of the photo a motion photo's clip belongs to, and the clip as a
+/// bare video message: what a later download needs and nothing else.
+fn motion_clip(base: &wa::Message) -> Option<(String, Vec<u8>)> {
+    if !motion_photo_child(base) {
+        return None;
+    }
+    let child = base
+        .associated_child_message
+        .as_option()?
+        .message
+        .as_option()?;
+    let video = child.video_message.as_option()?;
+    let parent = [base, child].into_iter().find_map(|message| {
+        message
+            .message_context_info
+            .as_option()?
+            .message_association
+            .as_option()?
+            .parent_message_key
+            .as_option()?
+            .id
+            .clone()
+            .filter(|id| !id.is_empty())
+    })?;
+    let clip = wa::Message {
+        video_message: MessageField::some(video.clone()),
+        ..Default::default()
+    };
+    Some((parent, clip.encode_to_vec()))
 }
 
 /// Uploaded attachment protobuf and archive content.
@@ -9827,6 +10132,7 @@ async fn prepare_media(
         return Ok(Prepared {
             message,
             content: Content::Image {
+                motion: None,
                 caption: None,
                 media: media(
                     Some(&"image/jpeg".to_owned()),
@@ -10295,6 +10601,7 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
     let mut revoked = Vec::new();
     let mut poll_updates = Vec::new();
     let mut reactions = Vec::new();
+    let mut clips = Vec::new();
     let mut newest = 0;
     for entry in &conversation.messages {
         let Some(info) = entry.message.as_option() else {
@@ -10434,6 +10741,15 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
                 from_me,
                 timestamp,
                 update: update.clone(),
+            });
+            continue;
+        }
+        if let Some((parent, raw)) = motion_clip(base) {
+            clips.push(HistoryClip {
+                parent,
+                sender,
+                from_me,
+                raw,
             });
             continue;
         }
@@ -10601,6 +10917,7 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
         more_on_phone,
         messages,
         revoked,
+        clips,
         poll_updates,
         reactions,
     }
@@ -11199,7 +11516,7 @@ mod tests {
             ..Default::default()
         };
         match classify(&image) {
-            Some(Content::Image { caption, media }) => {
+            Some(Content::Image { caption, media, .. }) => {
                 assert_eq!(caption.as_deref(), Some("look"));
                 assert_eq!(media.mime, "image/jpeg");
                 assert_eq!((media.width, media.height), (Some(4), Some(3)));
@@ -11554,6 +11871,188 @@ mod tests {
     }
 
     #[test]
+    fn a_masked_position_marks_the_share_it_cannot_move() {
+        const PEER: &str = super::receipt_tests::PEER;
+        let (mut worker, _events, _inbox, _wa) = super::receipt_tests::worker();
+        let start = crate::util::now() - 600;
+        let source = || MessageSource {
+            chat: PEER.parse().unwrap(),
+            sender: PEER.parse().unwrap(),
+            ..Default::default()
+        };
+        let ingest = |worker: &mut Worker, position: (Arc<wa::Message>, MessageInfo)| {
+            worker.ingest(&position.0, &position.1);
+        };
+        // Whether the share's card says the phone holds the newer positions.
+        let marked = |worker: &Worker| {
+            let share = worker.archive.message(PEER, "start").unwrap().unwrap();
+            match share.content {
+                Content::LiveLocation { newer_on_phone, .. } => newer_on_phone,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        // Ada shares where she is, and this device reads the position.
+        ingest(&mut worker, live_position("start", start, 1, 51.0, None));
+        assert!(!marked(&worker));
+        // She moves, and the phone keeps the positions to itself.
+        worker.ingest(
+            &masked_live_location(),
+            &live_location_info("masked", start + 60, source()),
+        );
+        assert_eq!(worker.archive.messages(PEER, None, 10).unwrap().len(), 1);
+        assert!(
+            marked(&worker),
+            "the card says where the newer positions are"
+        );
+        // A position this device can read takes the notice back.
+        ingest(
+            &mut worker,
+            live_position("p2", start + 120, 2, 51.1, Some("start")),
+        );
+        let rows = worker.archive.messages(PEER, None, 10).unwrap();
+        assert_eq!(rows.len(), 1, "the share keeps its one row");
+        assert!(!marked(&worker));
+    }
+
+    /// A history replay of the position a share started with reclassifies
+    /// the row the archive already holds, and that fresh classification
+    /// carries no newer readable position. It must not take back the notice
+    /// that the phone keeps the newer ones; a share the phone reports as
+    /// finished does.
+    #[test]
+    fn a_history_replay_keeps_the_live_location_notice() {
+        const PEER: &str = super::receipt_tests::PEER;
+        let (mut worker, _events, _inbox, _wa) = super::receipt_tests::worker();
+        let start = 1_700_000_000;
+        let source = || MessageSource {
+            chat: PEER.parse().unwrap(),
+            sender: PEER.parse().unwrap(),
+            ..Default::default()
+        };
+        let (message, info) = live_position("start", start, 1, 51.0, None);
+        worker.ingest(&message, &info);
+        // The phone keeps the positions that follow to itself.
+        worker.ingest(
+            &masked_live_location(),
+            &live_location_info("masked", start + 60, source()),
+        );
+        let marked = |worker: &Worker| {
+            let share = worker.archive.message(PEER, "start").unwrap().unwrap();
+            match share.content {
+                Content::LiveLocation { newer_on_phone, .. } => newer_on_phone,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert!(
+            marked(&worker),
+            "the card says where the newer positions are"
+        );
+        let replay = |worker: &mut Worker, finished: bool| {
+            worker.apply_history(
+                ParsedHistory {
+                    chats: vec![parse_conversation(wa::Conversation {
+                        id: PEER.into(),
+                        messages: vec![wa::HistorySyncMsg {
+                            message: MessageField::some(wa::WebMessageInfo {
+                                key: MessageField::some(wa::MessageKey {
+                                    id: Some("start".into()),
+                                    from_me: Some(false),
+                                    remote_jid: Some(PEER.into()),
+                                    ..Default::default()
+                                }),
+                                message: MessageField::some(wa::Message {
+                                    live_location_message: MessageField::some(
+                                        wa::message::LiveLocationMessage {
+                                            degrees_latitude: Some(51.0),
+                                            degrees_longitude: Some(-0.12),
+                                            sequence_number: Some(1),
+                                            time_offset: finished.then_some(600),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                    ..Default::default()
+                                }),
+                                message_timestamp: Some(start as u64),
+                                final_live_location: if finished {
+                                    MessageField::some(wa::message::LiveLocationMessage {
+                                        degrees_latitude: Some(51.0),
+                                        degrees_longitude: Some(-0.12),
+                                        sequence_number: Some(1),
+                                        time_offset: Some(600),
+                                        ..Default::default()
+                                    })
+                                } else {
+                                    MessageField::default()
+                                },
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })],
+                    push_names: Vec::new(),
+                    lids: Vec::new(),
+                    stickers: Vec::new(),
+                },
+                true,
+            );
+        };
+        // The same unfinished position, replayed.
+        replay(&mut worker, false);
+        assert!(
+            marked(&worker),
+            "a replay with no newer readable position keeps the notice"
+        );
+        // The same position, this time as the share's last one.
+        replay(&mut worker, true);
+        assert!(
+            !marked(&worker),
+            "a share the phone reports as finished takes the notice back"
+        );
+    }
+
+    /// A masked event that arrives out of order, older than the position the
+    /// card already shows, says nothing about the positions the phone keeps.
+    #[test]
+    fn an_out_of_order_masked_event_does_not_mark_the_card() {
+        const PEER: &str = super::receipt_tests::PEER;
+        let (mut worker, _events, _inbox, _wa) = super::receipt_tests::worker();
+        let start = crate::util::now() - 600;
+        let source = || MessageSource {
+            chat: PEER.parse().unwrap(),
+            sender: PEER.parse().unwrap(),
+            ..Default::default()
+        };
+        let ingest = |worker: &mut Worker, position: (Arc<wa::Message>, MessageInfo)| {
+            worker.ingest(&position.0, &position.1);
+        };
+        // Ada shares where she is, and this device reads both positions.
+        ingest(&mut worker, live_position("start", start, 1, 51.0, None));
+        ingest(
+            &mut worker,
+            live_position("p2", start + 300, 2, 51.1, Some("start")),
+        );
+        // A masked event from before that position arrives late.
+        worker.ingest(
+            &masked_live_location(),
+            &live_location_info("masked", start + 60, source()),
+        );
+        let share = worker.archive.message(PEER, "start").unwrap().unwrap();
+        assert!(
+            matches!(
+                share.content,
+                Content::LiveLocation {
+                    newer_on_phone: false,
+                    updated,
+                    ..
+                } if updated == start + 300
+            ),
+            "the card keeps the newer readable position: {:?}",
+            share.content
+        );
+    }
+
+    #[test]
     fn other_masked_messages_say_they_are_on_the_phone() {
         const PEER: &str = super::receipt_tests::PEER;
         let (mut worker, _events, _inbox, _wa) = super::receipt_tests::worker();
@@ -11763,6 +12262,50 @@ mod tests {
         assert!(matches!(
             classify(&message),
             Some(Content::Text { preview: None, .. })
+        ));
+    }
+
+    #[test]
+    fn the_video_half_of_a_motion_photo_is_not_a_message() {
+        let child = |association_type| wa::Message {
+            associated_child_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message {
+                    video_message: MessageField::some(wa::message::VideoMessage {
+                        mimetype: Some("video/mp4".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            message_context_info: MessageField::some(wa::MessageContextInfo {
+                message_association: MessageField::some(wa::MessageAssociation {
+                    association_type: Some(association_type),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        use wa::message_association::AssociationType;
+        assert_eq!(classify(&child(AssociationType::MOTION_PHOTO)), None);
+        // Without the photo's id there is nothing to attach the clip to.
+        assert_eq!(motion_clip(&child(AssociationType::MOTION_PHOTO)), None);
+        let mut clip = child(AssociationType::MOTION_PHOTO);
+        clip.message_context_info
+            .as_option_mut()
+            .and_then(|context| context.message_association.as_option_mut())
+            .unwrap()
+            .parent_message_key = MessageField::some(wa::MessageKey {
+            id: Some("photo".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            motion_clip(&clip).map(|(parent, _)| parent).as_deref(),
+            Some("photo")
+        );
+        assert!(matches!(
+            classify(&child(AssociationType::MEDIA_ALBUM)),
+            Some(Content::Unsupported { .. })
         ));
     }
 
@@ -13224,13 +13767,19 @@ mod receipt_tests {
             ("plain", &plain, None),
         ] {
             let mut message = own_message(id, 1);
-            let Some(Content::Image { mut media, caption }) = classify_base(raw.get_base_message())
+            let Some(Content::Image {
+                mut media, caption, ..
+            }) = classify_base(raw.get_base_message())
             else {
                 panic!("not an image");
             };
             media.path = path.map(std::path::PathBuf::from);
             // Filed as an ordinary photo, before view once was recognised.
-            message.content = Content::Image { caption, media };
+            message.content = Content::Image {
+                caption,
+                media,
+                motion: None,
+            };
             worker
                 .archive
                 .insert_message(&message, Some(&raw.encode_to_vec()))
@@ -14537,6 +15086,7 @@ mod receipt_tests {
         let (mut worker, _events, _inbox, _wa) = receipt_tests::worker();
         let mut picture = incoming("photo", 100);
         picture.content = Content::Image {
+            motion: None,
             media: Media {
                 mime: "image/jpeg".into(),
                 size: 10,
@@ -16243,6 +16793,7 @@ mod chat_removal_tests {
                     })
                     .collect(),
                 revoked: Vec::new(),
+                clips: Vec::new(),
                 poll_updates: Vec::new(),
                 reactions: Vec::new(),
             }],

@@ -16,6 +16,14 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
+#: src/ui/conversation.rs:5525
+msgid "Message"
+msgstr "Nachricht senden"
+
+#: src/ui/conversation.rs:5526
+msgid "Copy number"
+msgstr "Nummer kopieren"
+
 #: src/model.rs:113
 msgid "All"
 msgstr "Alle"
