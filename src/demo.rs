@@ -11188,18 +11188,21 @@ mod tests {
                 "{page}: one button hides or shows the list"
             );
             if page == "nosidebar" {
+                let mut expected = vec![
+                    Stop::Composer,
+                    Stop::Send,
+                    Stop::Attach,
+                    Stop::Emoji,
+                    Stop::ChatSearch,
+                    Stop::Profile,
+                    Stop::Sidebar,
+                ];
+                if !crate::theme::macos_chrome(&ctx) {
+                    expected.push(Stop::Settings);
+                }
                 assert_eq!(
                     controls.iter().map(|(stop, _)| *stop).collect::<Vec<_>>(),
-                    [
-                        Stop::Composer,
-                        Stop::Send,
-                        Stop::Attach,
-                        Stop::Emoji,
-                        Stop::ChatSearch,
-                        Stop::Profile,
-                        Stop::Sidebar,
-                        Stop::Settings
-                    ]
+                    expected
                 );
             }
             for backwards in [false, true] {
