@@ -166,13 +166,29 @@ impl Worker {
         }
         self.emit(Event::Call(Box::new(update.clone())));
         if finished {
-            let duration = update.started.map(|s| s.elapsed().as_secs() as i64).unwrap_or(0);
+            let duration = update
+                .started
+                .map(|s| s.elapsed().as_secs() as i64)
+                .unwrap_or(0);
             let status = match update.outcome {
                 Some(crate::calls::CallOutcome::Answered) => CallLogStatus::Connected,
-                Some(crate::calls::CallOutcome::Declined | crate::calls::CallOutcome::DeclinedElsewhere) => CallLogStatus::Rejected,
-                Some(crate::calls::CallOutcome::Missed | crate::calls::CallOutcome::NoAnswer) => CallLogStatus::Missed,
-                Some(crate::calls::CallOutcome::Failed | crate::calls::CallOutcome::Busy) => CallLogStatus::Failed,
-                _ => if duration > 0 { CallLogStatus::Connected } else { CallLogStatus::Other },
+                Some(
+                    crate::calls::CallOutcome::Declined
+                    | crate::calls::CallOutcome::DeclinedElsewhere,
+                ) => CallLogStatus::Rejected,
+                Some(crate::calls::CallOutcome::Missed | crate::calls::CallOutcome::NoAnswer) => {
+                    CallLogStatus::Missed
+                }
+                Some(crate::calls::CallOutcome::Failed | crate::calls::CallOutcome::Busy) => {
+                    CallLogStatus::Failed
+                }
+                _ => {
+                    if duration > 0 {
+                        CallLogStatus::Connected
+                    } else {
+                        CallLogStatus::Other
+                    }
+                }
             };
             let call_id = format!("call-{}-{}", update.chat, crate::util::now());
             let entry = CallLogEntry {
@@ -430,19 +446,28 @@ impl Worker {
             Some(runtime) => match event {
                 CallRuntimeEvent::Ended => runtime.call.media_ended(),
                 CallRuntimeEvent::Media(media) => {
-                    if matches!(media, CallEvent::RelayAllocated)
-                        && runtime.call.is_video()
-                    {
+                    if matches!(media, CallEvent::RelayAllocated) && runtime.call.is_video() {
                         if let Some(handle) = runtime.call.handle() {
                             handle.request_peer_keyframe(KeyframeUrgency::Immediate);
                         }
                         runtime.call.request_local_keyframe();
                     }
                     let mut needs_keyframe = matches!(media, CallEvent::VideoKeyframeNeeded);
-                    if let CallEvent::RtcpReceived { report_blocks, feedback, .. } = &media {
+                    if let CallEvent::RtcpReceived {
+                        report_blocks,
+                        feedback,
+                        ..
+                    } = &media
+                    {
                         let now = Instant::now();
-                        let max_loss = report_blocks.iter().map(|b| b.fraction_lost).max().unwrap_or(0);
-                        let has_pli = feedback.iter().any(|f| f.packet_type == 206 && matches!(f.fmt, 1 | 4));
+                        let max_loss = report_blocks
+                            .iter()
+                            .map(|b| b.fraction_lost)
+                            .max()
+                            .unwrap_or(0);
+                        let has_pli = feedback
+                            .iter()
+                            .any(|f| f.packet_type == 206 && matches!(f.fmt, 1 | 4));
                         if max_loss > 0 {
                             for block in report_blocks {
                                 if block.fraction_lost > 0 {
@@ -463,10 +488,12 @@ impl Worker {
                             log::info!("[CALL][RTCP] peer requested keyframe via RTCP PLI/FIR");
                         }
                         if max_loss >= 25 {
-                            if runtime.last_bitrate_adjust.elapsed() >= Duration::from_millis(1500) {
+                            if runtime.last_bitrate_adjust.elapsed() >= Duration::from_millis(1500)
+                            {
                                 runtime.last_bitrate_adjust = now;
                                 runtime.last_probe_up = now;
-                                let new_rate = (runtime.cur_video_bitrate * 85 / 100).max(runtime.min_video_bitrate);
+                                let new_rate = (runtime.cur_video_bitrate * 85 / 100)
+                                    .max(runtime.min_video_bitrate);
                                 if new_rate < runtime.cur_video_bitrate {
                                     runtime.cur_video_bitrate = new_rate;
                                     runtime.call.set_video_target_bitrate(new_rate);
@@ -477,13 +504,19 @@ impl Worker {
                                     );
                                 }
                             }
-                        } else if max_loss == 0 && runtime.last_probe_up.elapsed() >= Duration::from_secs(4) {
+                        } else if max_loss == 0
+                            && runtime.last_probe_up.elapsed() >= Duration::from_secs(4)
+                        {
                             runtime.last_probe_up = now;
                             if runtime.cur_video_bitrate < runtime.max_video_bitrate {
-                                let new_rate = (runtime.cur_video_bitrate + 25_000).min(runtime.max_video_bitrate);
+                                let new_rate = (runtime.cur_video_bitrate + 25_000)
+                                    .min(runtime.max_video_bitrate);
                                 runtime.cur_video_bitrate = new_rate;
                                 runtime.call.set_video_target_bitrate(new_rate);
-                                log::info!("[CALL][BWE] connection clean (0 loss): probed target bitrate to {}kbps", new_rate / 1000);
+                                log::info!(
+                                    "[CALL][BWE] connection clean (0 loss): probed target bitrate to {}kbps",
+                                    new_rate / 1000
+                                );
                             }
                         }
                     }
@@ -491,10 +524,14 @@ impl Worker {
                         let now = Instant::now();
                         if runtime.last_keyframe_req.elapsed() >= Duration::from_millis(1500) {
                             runtime.last_keyframe_req = now;
-                            log::info!("[CALL] peer requested keyframe: forcing local IDR keyframe");
+                            log::info!(
+                                "[CALL] peer requested keyframe: forcing local IDR keyframe"
+                            );
                             runtime.call.request_local_keyframe();
                         } else {
-                            log::debug!("[CALL] peer requested keyframe (throttled): skipping duplicate within 1500ms");
+                            log::debug!(
+                                "[CALL] peer requested keyframe (throttled): skipping duplicate within 1500ms"
+                            );
                         }
                     }
                     runtime.call.media(&media)

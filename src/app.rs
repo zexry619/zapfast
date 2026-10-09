@@ -3213,16 +3213,14 @@ impl App {
                 let stories_file = self.dirs.state.join("stories.json");
                 self.stories.save(&stories_file);
             }
-            Event::StoryPosted(result) => {
-                match result {
-                    Ok(()) => {
-                        self.toast(crate::i18n::gettext(self.locale, "Status update posted"));
-                    }
-                    Err(err) => {
-                        self.toast_error(format!("Failed to post status: {err}"));
-                    }
+            Event::StoryPosted(result) => match result {
+                Ok(()) => {
+                    self.toast(crate::i18n::gettext(self.locale, "Status update posted"));
                 }
-            }
+                Err(err) => {
+                    self.toast_error(format!("Failed to post status: {err}"));
+                }
+            },
             Event::StoryMediaDownloaded { id, path } => {
                 self.stories.set_media_path(&id, path);
                 let stories_file = self.dirs.state.join("stories.json");
@@ -3291,7 +3289,8 @@ impl App {
                     msg.starred = starred;
                 }
                 if !starred {
-                    self.starred_messages.retain(|m| !(m.id == id && m.chat == chat));
+                    self.starred_messages
+                        .retain(|m| !(m.id == id && m.chat == chat));
                 }
             }
             Event::MessagePinned { chat, pinned } => {
@@ -3329,7 +3328,12 @@ impl App {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64;
-                    let max_ts = self.call_logs.iter().map(|c| c.timestamp).max().unwrap_or(0);
+                    let max_ts = self
+                        .call_logs
+                        .iter()
+                        .map(|c| c.timestamp)
+                        .max()
+                        .unwrap_or(0);
                     let mark_ts = max_ts.max(now);
                     if mark_ts > self.settings.last_seen_call_timestamp {
                         self.settings.last_seen_call_timestamp = mark_ts;
@@ -3337,7 +3341,10 @@ impl App {
                     }
                 }
             }
-            Event::ChatEphemeralUpdated { chat, duration_secs } => {
+            Event::ChatEphemeralUpdated {
+                chat,
+                duration_secs,
+            } => {
                 if let Some(c) = self.chats.iter_mut().find(|c| c.id == chat) {
                     c.ephemeral_expiration = duration_secs;
                 }
@@ -4735,7 +4742,12 @@ impl App {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64;
-                    let max_ts = self.call_logs.iter().map(|c| c.timestamp).max().unwrap_or(0);
+                    let max_ts = self
+                        .call_logs
+                        .iter()
+                        .map(|c| c.timestamp)
+                        .max()
+                        .unwrap_or(0);
                     let mark_ts = max_ts.max(now);
                     if mark_ts > self.settings.last_seen_call_timestamp {
                         self.settings.last_seen_call_timestamp = mark_ts;
@@ -6447,8 +6459,13 @@ impl App {
             Action::NextStory => {
                 self.video.stop();
                 if let Some(viewer) = self.story_viewer.clone() {
-                    if let Some((next_sender, next_index)) = self.stories.next_item(&viewer.sender, viewer.index) {
-                        self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(next_sender, next_index));
+                    if let Some((next_sender, next_index)) =
+                        self.stories.next_item(&viewer.sender, viewer.index)
+                    {
+                        self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(
+                            next_sender,
+                            next_index,
+                        ));
                     } else {
                         self.video.set_expanded(false);
                         self.story_viewer = None;
@@ -6458,8 +6475,13 @@ impl App {
             Action::PrevStory => {
                 self.video.stop();
                 if let Some(viewer) = self.story_viewer.clone() {
-                    if let Some((prev_sender, prev_index)) = self.stories.prev_item(&viewer.sender, viewer.index) {
-                        self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(prev_sender, prev_index));
+                    if let Some((prev_sender, prev_index)) =
+                        self.stories.prev_item(&viewer.sender, viewer.index)
+                    {
+                        self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(
+                            prev_sender,
+                            prev_index,
+                        ));
                     } else {
                         self.video.set_expanded(false);
                         self.story_viewer = None;
@@ -6516,7 +6538,11 @@ impl App {
                     .unwrap_or(0);
                 let id = format!("local-status-{}", now);
                 let my_sender = self.me.clone().unwrap_or_else(|| "me".to_string());
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
                 let is_video = ["mp4", "mov", "mkv", "webm", "3gp"].contains(&ext.as_str());
 
                 self.stories.add(crate::stories::StoryItem {
@@ -6544,7 +6570,8 @@ impl App {
                 if is_video {
                     self.backend.send(Command::PostVideoStory { path, caption });
                 } else if let Ok(bytes) = std::fs::read(&path) {
-                    self.backend.send(Command::PostImageStory { bytes, caption });
+                    self.backend
+                        .send(Command::PostImageStory { bytes, caption });
                 }
             }
             Action::ReplyStory {
@@ -6655,7 +6682,13 @@ impl App {
                 if let Some(items) = self.stories.stories_by_sender.get(&jid) {
                     if !items.is_empty() {
                         let idx = items.iter().position(|it| !it.viewed).unwrap_or(0);
-                        self.apply(Action::OpenStoryViewer { sender: jid, index: idx }, ctx);
+                        self.apply(
+                            Action::OpenStoryViewer {
+                                sender: jid,
+                                index: idx,
+                            },
+                            ctx,
+                        );
                     }
                 }
             }
@@ -14017,7 +14050,10 @@ mod app_lock_tests {
             viewed: false,
         });
         app.apply(Action::SelectStoryContact(test_sender.clone()), &ctx);
-        assert_eq!(app.active_story_contact.as_deref(), Some(test_sender.as_str()));
+        assert_eq!(
+            app.active_story_contact.as_deref(),
+            Some(test_sender.as_str())
+        );
         assert!(app.story_viewer.is_some());
 
         // 3. Navigation to Calls and clearing unread missed calls count
@@ -14036,9 +14072,15 @@ mod app_lock_tests {
         let unseen_before = app
             .call_logs
             .iter()
-            .filter(|c| c.status == crate::model::CallLogStatus::Missed && c.timestamp > app.settings.last_seen_call_timestamp)
+            .filter(|c| {
+                c.status == crate::model::CallLogStatus::Missed
+                    && c.timestamp > app.settings.last_seen_call_timestamp
+            })
             .count();
-        assert_eq!(unseen_before, 1, "missed call should initially be counted as unread");
+        assert_eq!(
+            unseen_before, 1,
+            "missed call should initially be counted as unread"
+        );
 
         app.apply(Action::Open(Page::Calls), &ctx);
         assert_eq!(app.page, Page::Calls);
@@ -14049,9 +14091,15 @@ mod app_lock_tests {
         let unseen_after = app
             .call_logs
             .iter()
-            .filter(|c| c.status == crate::model::CallLogStatus::Missed && c.timestamp > app.settings.last_seen_call_timestamp)
+            .filter(|c| {
+                c.status == crate::model::CallLogStatus::Missed
+                    && c.timestamp > app.settings.last_seen_call_timestamp
+            })
             .count();
-        assert_eq!(unseen_after, 0, "missed call count should be 0 after opening Calls");
+        assert_eq!(
+            unseen_after, 0,
+            "missed call count should be 0 after opening Calls"
+        );
 
         // 4. Calls actions
         assert!(!app.calls_filter_missed);

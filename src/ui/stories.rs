@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant};
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, Vec2,
-    pos2, vec2,
+    Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, Vec2, pos2,
+    vec2,
 };
 
 use crate::app::App;
@@ -24,12 +24,7 @@ pub const STORY_COLORS: &[(u32, &str)] = &[
     (0xFF333D42, "Charcoal"),
 ];
 
-pub const STORY_FONTS: &[(&str, u32)] = &[
-    ("System", 0),
-    ("Script", 2),
-    ("Bold", 6),
-    ("Serif", 8),
-];
+pub const STORY_FONTS: &[(&str, u32)] = &[("System", 0), ("Script", 2), ("Bold", 6), ("Serif", 8)];
 
 /// State of the active story viewer overlay.
 #[derive(Clone, Debug)]
@@ -150,7 +145,9 @@ pub fn bar(app: &mut App, ui: &mut egui::Ui) {
 
                         // 2. Contacts with stories
                         for contact in &grouped {
-                            if contact.sender == "me" || contact.sender == app.me.as_deref().unwrap_or("") {
+                            if contact.sender == "me"
+                                || contact.sender == app.me.as_deref().unwrap_or("")
+                            {
                                 continue;
                             }
                             contact_story_item(app, ui, &palette, contact);
@@ -209,7 +206,9 @@ fn my_status_item(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
     }
 
     if has_stories {
-        response.on_hover_text("My status\nClick to view your status update\nUse '+' in header to add another");
+        response.on_hover_text(
+            "My status\nClick to view your status update\nUse '+' in header to add another",
+        );
     } else {
         response.on_hover_text("My status\nClick to add status update");
     }
@@ -240,7 +239,8 @@ fn my_status_item(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
     // Draw '+' badge at bottom-right of avatar
     let badge_center = pos2(avatar_center.x + 15.0, avatar_center.y + 15.0);
     ui.painter().circle_filled(badge_center, 9.0, palette.panel);
-    ui.painter().circle_filled(badge_center, 7.5, Color32::from_rgb(0, 168, 132));
+    ui.painter()
+        .circle_filled(badge_center, 7.5, Color32::from_rgb(0, 168, 132));
     ui.painter().text(
         badge_center + vec2(0.0, -1.0),
         Align2::CENTER_CENTER,
@@ -303,18 +303,22 @@ fn contact_story_item(
     };
 
     // Draw story ring around avatar
-    ui.painter().circle_stroke(
-        avatar_center,
-        24.0,
-        Stroke::new(2.2, ring_color),
-    );
+    ui.painter()
+        .circle_stroke(avatar_center, 24.0, Stroke::new(2.2, ring_color));
 
     // Draw contact avatar
     let picture = app.avatar(&contact.sender);
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(Rect::from_center_size(avatar_center, vec2(42.0, 42.0))),
         |ui| {
-            widgets::avatar(ui, palette, &contact.sender_name, &contact.sender, 42.0, picture.as_deref());
+            widgets::avatar(
+                ui,
+                palette,
+                &contact.sender_name,
+                &contact.sender,
+                42.0,
+                picture.as_deref(),
+            );
         },
     );
 
@@ -412,7 +416,10 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
     // Auto-detect if media file is already present in cache / download directory
     if current_item.media_path.is_none() && (is_video || is_image) {
         let ext = if is_video { "mp4" } else { "jpg" };
-        let candidate = app.dirs.media_cache_dir().join(format!("story-{}.{}", current_item.id, ext));
+        let candidate = app
+            .dirs
+            .media_cache_dir()
+            .join(format!("story-{}.{}", current_item.id, ext));
         if candidate.exists() {
             let path_str = candidate.to_string_lossy().to_string();
             current_item.media_path = Some(path_str.clone());
@@ -426,10 +433,11 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
             viewer.download_requested = true;
         }
         if let Some(ref raw) = current_item.raw_message {
-            app.backend.send(crate::backend::Command::DownloadStoryMedia {
-                id: current_item.id.clone(),
-                raw_message: raw.clone(),
-            });
+            app.backend
+                .send(crate::backend::Command::DownloadStoryMedia {
+                    id: current_item.id.clone(),
+                    raw_message: raw.clone(),
+                });
         }
     }
 
@@ -453,7 +461,8 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
         (
             i.key_pressed(egui::Key::Escape),
             !typing_reply && i.key_pressed(egui::Key::ArrowLeft),
-            !typing_reply && (i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::Enter)),
+            !typing_reply
+                && (i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::Enter)),
             !typing_reply && i.key_pressed(egui::Key::Space),
         )
     });
@@ -502,7 +511,8 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
         && (video_status.as_ref().map_or(true, |vs| {
             vs.state == crate::video::State::Loading || vs.frame.is_none()
         }));
-    let is_image_loading = is_image && current_item.media_path.is_none() && current_item.raw_message.is_some();
+    let is_image_loading =
+        is_image && current_item.media_path.is_none() && current_item.raw_message.is_some();
     let is_media_loading = is_video_loading || is_image_loading;
 
     let screen = bounds.unwrap_or_else(|| ctx.content_rect());
@@ -551,7 +561,9 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
                         viewer.hold_started_at = Some(now);
                     }
                 } else if let Some(started) = state.hold_started_at {
-                    if now.duration_since(started) >= Duration::from_millis(180) && !state.is_holding {
+                    if now.duration_since(started) >= Duration::from_millis(180)
+                        && !state.is_holding
+                    {
                         if let Some(viewer) = app.story_viewer.as_mut() {
                             viewer.is_holding = true;
                         }
@@ -562,7 +574,10 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
     } else if pointer_released || (!pointer_down && state.hold_started_at.is_some()) {
         if let Some(viewer) = app.story_viewer.as_mut() {
             let was_holding = viewer.is_holding;
-            let hold_dur = viewer.hold_started_at.map(|t| t.elapsed()).unwrap_or_default();
+            let hold_dur = viewer
+                .hold_started_at
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
             viewer.hold_started_at = None;
             viewer.is_holding = false;
 
@@ -708,7 +723,11 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
                             pos2(card_rect.center().x, card_rect.center().y),
                             vec2(300.0, 110.0),
                         );
-                        ui.painter().rect_filled(box_rect, CornerRadius::same(12), Color32::from_black_alpha(210));
+                        ui.painter().rect_filled(
+                            box_rect,
+                            CornerRadius::same(12),
+                            Color32::from_black_alpha(210),
+                        );
                         ui.painter().text(
                             pos2(box_rect.center().x, box_rect.top() + 20.0),
                             Align2::CENTER_CENTER,
@@ -732,7 +751,11 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
                             } else {
                                 palette.accent.gamma_multiply(0.85)
                             };
-                            ui.painter().rect_filled(unsupported_btn_rect, CornerRadius::same(8), btn_bg);
+                            ui.painter().rect_filled(
+                                unsupported_btn_rect,
+                                CornerRadius::same(8),
+                                btn_bg,
+                            );
                             ui.painter().text(
                                 unsupported_btn_rect.center(),
                                 Align2::CENTER_CENTER,
@@ -744,18 +767,27 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
                             if btn_resp.clicked() {
-                                app.actions.push(Action::OpenFile(std::path::PathBuf::from(media_path)));
+                                app.actions
+                                    .push(Action::OpenFile(std::path::PathBuf::from(media_path)));
                             }
                         }
-                    } else if is_video_loading && (current_item.raw_message.is_some() || current_item.media_path.is_some()) {
+                    } else if is_video_loading
+                        && (current_item.raw_message.is_some() || current_item.media_path.is_some())
+                    {
                         let disc = Rect::from_center_size(card_rect.center(), vec2(48.0, 48.0));
                         theme::paint_spinner(ui, disc, 28.0, Color32::WHITE);
-                    } else if current_item.media_path.is_none() && current_item.raw_message.is_none() {
+                    } else if current_item.media_path.is_none()
+                        && current_item.raw_message.is_none()
+                    {
                         let label_rect = Rect::from_center_size(
                             pos2(card_rect.center().x, card_rect.center().y + 50.0),
                             vec2(240.0, 30.0),
                         );
-                        ui.painter().rect_filled(label_rect, CornerRadius::same(8), Color32::from_black_alpha(180));
+                        ui.painter().rect_filled(
+                            label_rect,
+                            CornerRadius::same(8),
+                            Color32::from_black_alpha(180),
+                        );
                         ui.painter().text(
                             label_rect.center(),
                             Align2::CENTER_CENTER,
@@ -800,7 +832,11 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
                         pos2(card_rect.center().x, card_rect.bottom() - 100.0),
                         vec2(220.0, 26.0),
                     );
-                    ui.painter().rect_filled(label_rect, CornerRadius::same(6), Color32::from_black_alpha(160));
+                    ui.painter().rect_filled(
+                        label_rect,
+                        CornerRadius::same(6),
+                        Color32::from_black_alpha(160),
+                    );
                     ui.painter().text(
                         label_rect.center(),
                         Align2::CENTER_CENTER,
@@ -838,7 +874,8 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
                     );
                 }
 
-                let is_my_story = state.sender == "me" || state.sender == app.me.as_deref().unwrap_or("");
+                let is_my_story =
+                    state.sender == "me" || state.sender == app.me.as_deref().unwrap_or("");
                 // 3. Caption if present
                 if let Some(caption) = &current_item.caption {
                     let cap_y = if is_my_story {
@@ -891,10 +928,8 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
                     };
 
                     if fill_fraction > 0.0 {
-                        let filled_rect = Rect::from_min_size(
-                            seg_rect.min,
-                            vec2(bar_width * fill_fraction, 3.0),
-                        );
+                        let filled_rect =
+                            Rect::from_min_size(seg_rect.min, vec2(bar_width * fill_fraction, 3.0));
                         ui.painter().rect_filled(
                             filled_rect,
                             CornerRadius::same(2),
@@ -986,14 +1021,16 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
                     }
                     theme::paint_icon(ui, Icon::Trash, delete_rect, 15.0, Color32::WHITE);
                     if del_resp.clicked() {
-                        app.actions.push(Action::RevokeStory(current_item.id.clone()));
+                        app.actions
+                            .push(Action::RevokeStory(current_item.id.clone()));
                     }
                 }
 
                 // Persistent Pause indicator in center of card (when not held)
                 if state.paused && !is_media_loading {
                     let pause_center = card_rect.center();
-                    ui.painter().circle_filled(pause_center, 28.0, Color32::from_black_alpha(160));
+                    ui.painter()
+                        .circle_filled(pause_center, 28.0, Color32::from_black_alpha(160));
                     ui.painter().text(
                         pause_center,
                         Align2::CENTER_CENTER,
@@ -1019,7 +1056,8 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
 
                     for (idx, &emoji) in EMOJIS.iter().enumerate() {
                         let rx = start_rx + idx as f32 * (btn_size + gap);
-                        let r_rect = Rect::from_min_size(pos2(rx, reactions_y), Vec2::splat(btn_size));
+                        let r_rect =
+                            Rect::from_min_size(pos2(rx, reactions_y), Vec2::splat(btn_size));
                         let r_resp = ui.allocate_rect(r_rect, Sense::click());
                         let hovered = r_resp.hovered();
 
@@ -1037,8 +1075,13 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
                         } else {
                             Color32::from_white_alpha(45)
                         };
-                        ui.painter().circle_filled(r_rect.center(), btn_size / 2.0, fill);
-                        ui.painter().circle_stroke(r_rect.center(), btn_size / 2.0, Stroke::new(1.0, stroke_color));
+                        ui.painter()
+                            .circle_filled(r_rect.center(), btn_size / 2.0, fill);
+                        ui.painter().circle_stroke(
+                            r_rect.center(),
+                            btn_size / 2.0,
+                            Stroke::new(1.0, stroke_color),
+                        );
 
                         let emoji_scale = if hovered { 18.0 } else { 16.0 };
                         ui.painter().text(
@@ -1086,92 +1129,101 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
                         );
                     } else {
                         // Interactive input layout
-                        ui.scope_builder(
-                            egui::UiBuilder::new().max_rect(reply_bar_rect),
-                            |ui| {
-                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                    ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
-                                    ui.add_space(14.0);
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(reply_bar_rect), |ui| {
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
+                                ui.add_space(14.0);
 
-                                    // Chat icon
-                                    let (icon_rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                                    theme::paint_icon(
-                                        ui,
-                                        Icon::MessageCircle,
-                                        icon_rect,
-                                        16.0,
-                                        Color32::from_white_alpha(150),
+                                // Chat icon
+                                let (icon_rect, _) =
+                                    ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                                theme::paint_icon(
+                                    ui,
+                                    Icon::MessageCircle,
+                                    icon_rect,
+                                    16.0,
+                                    Color32::from_white_alpha(150),
+                                );
+
+                                // TextEdit field without nested box border
+                                let mut submit = false;
+                                let available = (ui.available_width() - 48.0).max(60.0);
+                                if let Some(viewer) = app.story_viewer.as_mut() {
+                                    let te = egui::TextEdit::singleline(&mut viewer.reply_text)
+                                        .frame(egui::Frame::NONE)
+                                        .hint_text("Balas status...")
+                                        .text_color(Color32::WHITE)
+                                        .font(egui::FontId::proportional(14.0))
+                                        .desired_width(available);
+                                    let te_resp = ui.add(te);
+                                    if te_resp.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                    {
+                                        submit = true;
+                                    }
+                                    if submit && !viewer.reply_text.trim().is_empty() {
+                                        text_to_send = Some(viewer.reply_text.trim().to_string());
+                                        viewer.reply_text.clear();
+                                        viewer.reply_sent = true;
+                                        viewer.reply_sent_at = Some(Instant::now());
+                                    }
+                                }
+
+                                // Send circular button
+                                let has_text = app
+                                    .story_viewer
+                                    .as_ref()
+                                    .is_some_and(|v| !v.reply_text.trim().is_empty());
+                                let send_btn_size = vec2(32.0, 32.0);
+                                let (send_rect, send_resp) =
+                                    ui.allocate_exact_size(send_btn_size, Sense::click());
+                                let send_hovered = send_resp.hovered();
+
+                                if has_text {
+                                    if send_hovered {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    let fill = if send_hovered {
+                                        Color32::from_rgb(0, 190, 150)
+                                    } else {
+                                        Color32::from_rgb(0, 168, 132)
+                                    };
+                                    ui.painter().circle_filled(send_rect.center(), 16.0, fill);
+                                    ui.painter().text(
+                                        send_rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        "➤",
+                                        egui::FontId::proportional(13.0),
+                                        Color32::WHITE,
                                     );
+                                } else {
+                                    ui.painter().circle_filled(
+                                        send_rect.center(),
+                                        16.0,
+                                        Color32::from_white_alpha(20),
+                                    );
+                                    ui.painter().text(
+                                        send_rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        "➤",
+                                        egui::FontId::proportional(13.0),
+                                        Color32::from_white_alpha(80),
+                                    );
+                                }
 
-                                    // TextEdit field without nested box border
-                                    let mut submit = false;
-                                    let available = (ui.available_width() - 48.0).max(60.0);
+                                if send_resp.clicked() && has_text {
                                     if let Some(viewer) = app.story_viewer.as_mut() {
-                                        let te = egui::TextEdit::singleline(&mut viewer.reply_text)
-                                            .frame(egui::Frame::NONE)
-                                            .hint_text("Balas status...")
-                                            .text_color(Color32::WHITE)
-                                            .font(egui::FontId::proportional(14.0))
-                                            .desired_width(available);
-                                        let te_resp = ui.add(te);
-                                        if te_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                            submit = true;
-                                        }
-                                        if submit && !viewer.reply_text.trim().is_empty() {
-                                            text_to_send = Some(viewer.reply_text.trim().to_string());
+                                        if !viewer.reply_text.trim().is_empty() {
+                                            text_to_send =
+                                                Some(viewer.reply_text.trim().to_string());
                                             viewer.reply_text.clear();
                                             viewer.reply_sent = true;
                                             viewer.reply_sent_at = Some(Instant::now());
                                         }
                                     }
-
-                                    // Send circular button
-                                    let has_text = app.story_viewer.as_ref().is_some_and(|v| !v.reply_text.trim().is_empty());
-                                    let send_btn_size = vec2(32.0, 32.0);
-                                    let (send_rect, send_resp) = ui.allocate_exact_size(send_btn_size, Sense::click());
-                                    let send_hovered = send_resp.hovered();
-
-                                    if has_text {
-                                        if send_hovered {
-                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                        }
-                                        let fill = if send_hovered {
-                                            Color32::from_rgb(0, 190, 150)
-                                        } else {
-                                            Color32::from_rgb(0, 168, 132)
-                                        };
-                                        ui.painter().circle_filled(send_rect.center(), 16.0, fill);
-                                        ui.painter().text(
-                                            send_rect.center(),
-                                            Align2::CENTER_CENTER,
-                                            "➤",
-                                            egui::FontId::proportional(13.0),
-                                            Color32::WHITE,
-                                        );
-                                    } else {
-                                        ui.painter().circle_filled(send_rect.center(), 16.0, Color32::from_white_alpha(20));
-                                        ui.painter().text(
-                                            send_rect.center(),
-                                            Align2::CENTER_CENTER,
-                                            "➤",
-                                            egui::FontId::proportional(13.0),
-                                            Color32::from_white_alpha(80),
-                                        );
-                                    }
-
-                                    if send_resp.clicked() && has_text {
-                                        if let Some(viewer) = app.story_viewer.as_mut() {
-                                            if !viewer.reply_text.trim().is_empty() {
-                                                text_to_send = Some(viewer.reply_text.trim().to_string());
-                                                viewer.reply_text.clear();
-                                                viewer.reply_sent = true;
-                                                viewer.reply_sent_at = Some(Instant::now());
-                                            }
-                                        }
-                                    }
-                                });
-                            },
-                        );
+                                }
+                            });
+                        });
                     }
 
                     if let Some(emoji) = chosen_emoji {
@@ -1224,7 +1276,8 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
                 } else {
                     Color32::from_white_alpha(20)
                 };
-                ui.painter().circle_filled(left_arrow_rect.center(), 20.0, left_bg);
+                ui.painter()
+                    .circle_filled(left_arrow_rect.center(), 20.0, left_bg);
                 ui.painter().text(
                     left_arrow_rect.center(),
                     Align2::CENTER_CENTER,
@@ -1242,7 +1295,8 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
                 } else {
                     Color32::from_white_alpha(20)
                 };
-                ui.painter().circle_filled(right_arrow_rect.center(), 20.0, right_bg);
+                ui.painter()
+                    .circle_filled(right_arrow_rect.center(), 20.0, right_bg);
                 ui.painter().text(
                     right_arrow_rect.center(),
                     Align2::CENTER_CENTER,
@@ -1259,8 +1313,14 @@ pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) 
             if ctx.input(|i| i.pointer.primary_clicked()) {
                 if let Some(pos) = pointer_pos {
                     if !card_rect.contains(pos) {
-                        let left_arrow = Rect::from_center_size(pos2(card_rect.left() - 40.0, card_rect.center().y), vec2(50.0, 50.0));
-                        let right_arrow = Rect::from_center_size(pos2(card_rect.right() + 40.0, card_rect.center().y), vec2(50.0, 50.0));
+                        let left_arrow = Rect::from_center_size(
+                            pos2(card_rect.left() - 40.0, card_rect.center().y),
+                            vec2(50.0, 50.0),
+                        );
+                        let right_arrow = Rect::from_center_size(
+                            pos2(card_rect.right() + 40.0, card_rect.center().y),
+                            vec2(50.0, 50.0),
+                        );
                         if !left_arrow.contains(pos) && !right_arrow.contains(pos) {
                             app.actions.push(Action::CloseStoryViewer);
                         }
@@ -1299,7 +1359,16 @@ pub fn post_modal_show(app: &mut App, ctx: &egui::Context) {
                     palette.text,
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if theme::icon_button(ui, Icon::X, 18.0, palette.secondary, palette.text, "Close").clicked() {
+                    if theme::icon_button(
+                        ui,
+                        Icon::X,
+                        18.0,
+                        palette.secondary,
+                        palette.text,
+                        "Close",
+                    )
+                    .clicked()
+                    {
                         app.actions.push(Action::ClosePostStory);
                     }
                 });
@@ -1434,7 +1503,8 @@ pub fn post_modal_show(app: &mut App, ctx: &egui::Context) {
                     preview_rect.center().x - preview_galley.size().x / 2.0,
                     preview_rect.center().y - preview_galley.size().y / 2.0,
                 );
-                ui.painter().galley(text_pos, preview_galley, Color32::WHITE);
+                ui.painter()
+                    .galley(text_pos, preview_galley, Color32::WHITE);
             }
 
             ui.add_space(12.0);
@@ -1501,7 +1571,12 @@ pub fn post_modal_show(app: &mut App, ctx: &egui::Context) {
                 ui.add_space(10.0);
 
                 // Color picker row
-                theme::text(ui, "Background color", theme::medium(12.0), palette.secondary);
+                theme::text(
+                    ui,
+                    "Background color",
+                    theme::medium(12.0),
+                    palette.secondary,
+                );
                 ui.add_space(6.0);
 
                 ui.horizontal(|ui| {
@@ -1582,10 +1657,8 @@ pub fn post_modal_show(app: &mut App, ctx: &egui::Context) {
                             });
                         } else {
                             let text = app.post_story_text.trim().to_string();
-                            let bg =
-                                STORY_COLORS[app.post_story_color_idx % STORY_COLORS.len()].0;
-                            let font =
-                                STORY_FONTS[app.post_story_font_idx % STORY_FONTS.len()].1;
+                            let bg = STORY_COLORS[app.post_story_color_idx % STORY_COLORS.len()].0;
+                            let font = STORY_FONTS[app.post_story_font_idx % STORY_FONTS.len()].1;
 
                             app.actions.push(Action::PostTextStory {
                                 text,

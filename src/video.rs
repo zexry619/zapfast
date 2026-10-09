@@ -1092,8 +1092,7 @@ fn convert(planes: &Planes<'_>, out: (usize, usize), turns: u8) -> ColorImage {
             let u = &planes.u[(oy / 2) * planes.strides.1..];
             let v = &planes.v[(oy / 2) * planes.strides.2..];
             for ox in 0..width {
-                pixels[row_offset + ox] =
-                    rgb(luma[ox] as i32, u[ox / 2] as i32, v[ox / 2] as i32);
+                pixels[row_offset + ox] = rgb(luma[ox] as i32, u[ox / 2] as i32, v[ox / 2] as i32);
             }
         }
         return ColorImage::new(turned, pixels);
@@ -1124,10 +1123,7 @@ fn convert(planes: &Planes<'_>, out: (usize, usize), turns: u8) -> ColorImage {
     let sx_table: Vec<usize> = (0..out_width)
         .map(|ox| (ox * width / out_width).min(width - 1))
         .collect();
-    let right_table: Vec<usize> = sx_table
-        .iter()
-        .map(|&sx| (sx + 1).min(width - 1))
-        .collect();
+    let right_table: Vec<usize> = sx_table.iter().map(|&sx| (sx + 1).min(width - 1)).collect();
 
     let mut pixels = vec![egui::Color32::BLACK; out_width * out_height];
     for oy in 0..out_height {

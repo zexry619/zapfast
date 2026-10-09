@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use serde::{Deserialize, Serialize};
 
 /// Type of media attached to a story.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,12 +157,10 @@ impl StoriesStore {
             })
             .collect();
 
-        groups.sort_by(|a, b| {
-            match (a.has_unviewed, b.has_unviewed) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => b.latest_timestamp.cmp(&a.latest_timestamp),
-            }
+        groups.sort_by(|a, b| match (a.has_unviewed, b.has_unviewed) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => b.latest_timestamp.cmp(&a.latest_timestamp),
         });
 
         groups
@@ -316,4 +314,3 @@ mod tests {
         assert_eq!(store.prev_item("alice", 0), None);
     }
 }
-

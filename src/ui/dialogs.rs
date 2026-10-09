@@ -1,6 +1,8 @@
 //! Shortcuts, account, linking, contact, and chat dialogs.
 
-use egui::{Align, Align2, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, Vec2, pos2, vec2};
+use egui::{
+    Align, Align2, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, Vec2, pos2, vec2,
+};
 
 use crate::app::App;
 use crate::model::{Action, Dialog};
@@ -97,14 +99,9 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     message_id,
                     from_me,
                     participant,
-                } => pin_message_dialog(
-                    app,
-                    ui,
-                    &chat,
-                    &message_id,
-                    from_me,
-                    participant.as_deref(),
-                ),
+                } => {
+                    pin_message_dialog(app, ui, &chat, &message_id, from_me, participant.as_deref())
+                }
                 Dialog::DisappearingMessages(chat) => disappearing_messages_dialog(app, ui, &chat),
             }
         });
@@ -2183,7 +2180,11 @@ pub(super) fn danger_button(ui: &mut egui::Ui, app: &mut App, label: &str) -> bo
 
 fn starred_messages_dialog(app: &mut App, ui: &mut egui::Ui, chat: Option<String>) {
     let palette = app.palette;
-    title(ui, app, &crate::i18n::gettext(app.locale, "Starred messages"));
+    title(
+        ui,
+        app,
+        &crate::i18n::gettext(app.locale, "Starred messages"),
+    );
     ui.add_space(4.0);
 
     if app.starred_filter_chat != chat {
@@ -2196,13 +2197,7 @@ fn starred_messages_dialog(app: &mut App, ui: &mut egui::Ui, chat: Option<String
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
             let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
-            theme::paint_icon(
-                ui,
-                Icon::Star,
-                icon_rect,
-                24.0,
-                palette.dim,
-            );
+            theme::paint_icon(ui, Icon::Star, icon_rect, 24.0, palette.dim);
             ui.add_space(8.0);
             theme::text(
                 ui,
@@ -2232,10 +2227,8 @@ fn starred_messages_dialog(app: &mut App, ui: &mut egui::Ui, chat: Option<String
         .auto_shrink([false, false])
         .show_rows(ui, row_height, messages.len(), |ui, range| {
             for m in &messages[range] {
-                let (rect, resp) = ui.allocate_exact_size(
-                    vec2(ui.available_width(), row_height),
-                    Sense::click(),
-                );
+                let (rect, resp) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click());
                 if ui.is_rect_visible(rect) {
                     if resp.hovered() {
                         super::widgets::dialog_row_highlight(ui, rect, palette.surface_hover);
@@ -2274,11 +2267,7 @@ fn starred_messages_dialog(app: &mut App, ui: &mut egui::Ui, chat: Option<String
                         rect.width() - 40.0,
                         1,
                     );
-                    line.paint(
-                        ui,
-                        pos2(rect.left() + 8.0, rect.top() + 24.0),
-                        palette.text,
-                    );
+                    line.paint(ui, pos2(rect.left() + 8.0, rect.top() + 24.0), palette.text);
 
                     let unstar_rect = Rect::from_center_size(
                         pos2(rect.right() - 16.0, rect.center().y + 8.0),
@@ -2365,13 +2354,7 @@ fn call_history_dialog(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
             let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
-            theme::paint_icon(
-                ui,
-                Icon::Phone,
-                icon_rect,
-                24.0,
-                palette.dim,
-            );
+            theme::paint_icon(ui, Icon::Phone, icon_rect, 24.0, palette.dim);
             ui.add_space(8.0);
             theme::text(
                 ui,
@@ -2394,10 +2377,8 @@ fn call_history_dialog(app: &mut App, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .show_rows(ui, row_height, logs.len(), |ui, range| {
             for log in &logs[range] {
-                let (rect, resp) = ui.allocate_exact_size(
-                    vec2(ui.available_width(), row_height),
-                    Sense::click(),
-                );
+                let (rect, resp) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click());
                 if ui.is_rect_visible(rect) {
                     if resp.hovered() {
                         super::widgets::dialog_row_highlight(ui, rect, palette.surface_hover);
@@ -2420,20 +2401,12 @@ fn call_history_dialog(app: &mut App, ui: &mut egui::Ui) {
                     theme::paint_icon(ui, icon, icon_rect, 16.0, status_color);
 
                     let name = log.peer_name.as_deref().unwrap_or(&log.peer);
-                    let dir_str = if log.from_me {
-                        "Outgoing"
-                    } else {
-                        "Incoming"
-                    };
+                    let dir_str = if log.from_me { "Outgoing" } else { "Incoming" };
                     let status_str = match log.status {
                         crate::model::CallLogStatus::Missed => "Missed".to_string(),
                         crate::model::CallLogStatus::Connected => {
                             if log.duration > 0 {
-                                format!(
-                                    "{dir_str} ({}m {}s)",
-                                    log.duration / 60,
-                                    log.duration % 60
-                                )
+                                format!("{dir_str} ({}m {}s)", log.duration / 60, log.duration % 60)
                             } else {
                                 dir_str.to_string()
                             }
@@ -2519,11 +2492,7 @@ fn disappearing_messages_dialog(app: &mut App, ui: &mut egui::Ui, chat: &str) {
         if theme::soft_button(
             ui,
             &palette,
-            if is_selected {
-                Some(Icon::Check)
-            } else {
-                None
-            },
+            if is_selected { Some(Icon::Check) } else { None },
             label,
             is_selected,
         )

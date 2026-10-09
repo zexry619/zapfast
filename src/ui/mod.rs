@@ -2,6 +2,7 @@
 
 pub mod accounts;
 pub mod call;
+pub mod calls_page;
 pub mod chats;
 pub mod conversation;
 pub mod dialogs;
@@ -15,10 +16,9 @@ pub mod message_info;
 pub mod pane;
 pub mod picker;
 pub mod polls;
+pub mod rail;
 pub mod settings;
 pub mod stories;
-pub mod calls_page;
-pub mod rail;
 pub mod stories_page;
 pub mod update;
 pub mod video_preview;

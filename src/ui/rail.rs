@@ -2,11 +2,11 @@
 
 use egui::{CornerRadius, Frame, Margin, Rect, Sense, pos2, vec2};
 
+use super::focus::{Stop, TabStop};
+use super::widgets;
 use crate::app::App;
 use crate::model::{Action, CallLogStatus, Page};
 use crate::theme::{self, Icon, Palette};
-use super::focus::{Stop, TabStop};
-use super::widgets;
 
 pub const RAIL_WIDTH: f32 = 64.0;
 
@@ -21,12 +21,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .resizable(false)
         .exact_size(RAIL_WIDTH)
         .show_separator_line(false)
-        .frame(Frame::new().fill(palette.window).inner_margin(Margin::symmetric(0, 8)));
+        .frame(
+            Frame::new()
+                .fill(palette.window)
+                .inner_margin(Margin::symmetric(0, 8)),
+        );
 
     let response = panel.show(ui, |ui| {
         let inset = theme::traffic_light_inset(ui.ctx());
         if inset > 0.0 {
-            let (strip, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+            let (strip, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
             super::titlebar_drag(ui, strip);
         } else {
             ui.add_space(4.0);
@@ -62,9 +67,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             // 2. Stories / Status
             let is_stories = app.page == Page::Stories;
             let my_jid = app.me.as_deref().unwrap_or_default();
-            let has_unviewed = app.stories.grouped().iter().any(|c| {
-                c.sender != "status@broadcast" && c.sender != my_jid && c.has_unviewed
-            });
+            let has_unviewed =
+                app.stories.grouped().iter().any(|c| {
+                    c.sender != "status@broadcast" && c.sender != my_jid && c.has_unviewed
+                });
             let status_badge = if has_unviewed {
                 Some(BadgeKind::Dot(palette.accent))
             } else {
@@ -124,7 +130,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         // Bottom Navigation Icons
         ui.vertical_centered(|ui| {
             // Starred messages
-            let is_starred_open = matches!(app.dialog, Some(crate::model::Dialog::StarredMessages { .. }));
+            let is_starred_open = matches!(
+                app.dialog,
+                Some(crate::model::Dialog::StarredMessages { .. })
+            );
             if nav_button(
                 ui,
                 &palette,
@@ -135,7 +144,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             )
             .clicked()
             {
-                app.actions.push(Action::ShowDialog(crate::model::Dialog::StarredMessages { chat: None }));
+                app.actions
+                    .push(Action::ShowDialog(crate::model::Dialog::StarredMessages {
+                        chat: None,
+                    }));
             }
 
             ui.add_space(8.0);
@@ -182,17 +194,11 @@ fn nav_button(
     if ui.is_rect_visible(rect) {
         // Draw background pill
         if is_active {
-            ui.painter().rect_filled(
-                rect,
-                CornerRadius::same(12),
-                palette.surface_active,
-            );
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(12), palette.surface_active);
         } else if hovered {
-            ui.painter().rect_filled(
-                rect,
-                CornerRadius::same(12),
-                palette.surface_hover,
-            );
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(12), palette.surface_hover);
         }
 
         // Draw icon
@@ -205,7 +211,11 @@ fn nav_button(
         };
 
         let icon_size = 22.0;
-        let scale = if response.is_pointer_button_down_on() { 0.92 } else { 1.0 };
+        let scale = if response.is_pointer_button_down_on() {
+            0.92
+        } else {
+            1.0
+        };
         theme::paint_icon(ui, icon, rect, icon_size * scale, icon_color);
 
         // Draw badge if any
@@ -221,7 +231,9 @@ fn nav_button(
                 } else {
                     count.to_string()
                 };
-                let galley = ui.painter().layout_no_wrap(label, theme::bold(10.0), palette.on_accent);
+                let galley =
+                    ui.painter()
+                        .layout_no_wrap(label, theme::bold(10.0), palette.on_accent);
                 let badge_h = 16.0;
                 let badge_w = (galley.size().x + 8.0).max(badge_h);
                 let badge_center = pos2(rect.right() - 6.0, rect.top() + 8.0);
@@ -232,11 +244,8 @@ fn nav_button(
                     CornerRadius::same(10),
                     palette.window,
                 );
-                ui.painter().rect_filled(
-                    badge_rect,
-                    CornerRadius::same(8),
-                    palette.accent,
-                );
+                ui.painter()
+                    .rect_filled(badge_rect, CornerRadius::same(8), palette.accent);
                 ui.painter().galley(
                     badge_rect.center() - galley.size() / 2.0,
                     galley,

@@ -1,15 +1,14 @@
 //! Stories / Status dedicated page: sidebar list and main viewer.
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke,
-    pos2, vec2,
+    Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, pos2, vec2,
 };
 
+use super::{stories, widgets};
 use crate::app::App;
 use crate::model::Action;
 use crate::stories::ContactStories;
 use crate::theme::{self, Icon, Palette};
-use super::{stories, widgets};
 
 /// Renders the status sidebar with "My status", "Recent updates", and "Viewed updates".
 pub fn sidebar(app: &mut App, ui: &mut egui::Ui) {
@@ -45,12 +44,18 @@ pub fn sidebar(app: &mut App, ui: &mut egui::Ui) {
                 // Partition into recent (unviewed) and viewed
                 let (recent, viewed): (Vec<&ContactStories>, Vec<&ContactStories>) = grouped
                     .iter()
-                    .filter(|c| c.sender != "me" && c.sender != my_jid && c.sender != "status@broadcast")
+                    .filter(|c| {
+                        c.sender != "me" && c.sender != my_jid && c.sender != "status@broadcast"
+                    })
                     .partition(|c| c.has_unviewed);
 
                 // Recent updates
                 if !recent.is_empty() {
-                    section_header(ui, &palette, &crate::i18n::gettext(app.locale, "Recent updates"));
+                    section_header(
+                        ui,
+                        &palette,
+                        &crate::i18n::gettext(app.locale, "Recent updates"),
+                    );
                     for contact in &recent {
                         contact_status_row(app, ui, &palette, contact, true);
                     }
@@ -59,16 +64,18 @@ pub fn sidebar(app: &mut App, ui: &mut egui::Ui) {
 
                 // Viewed updates
                 if !viewed.is_empty() {
-                    section_header(ui, &palette, &crate::i18n::gettext(app.locale, "Viewed updates"));
+                    section_header(
+                        ui,
+                        &palette,
+                        &crate::i18n::gettext(app.locale, "Viewed updates"),
+                    );
                     for contact in &viewed {
                         contact_status_row(app, ui, &palette, contact, false);
                     }
                 }
 
                 // If no contact updates
-                if grouped.is_empty()
-                    || (recent.is_empty() && viewed.is_empty())
-                {
+                if grouped.is_empty() || (recent.is_empty() && viewed.is_empty()) {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
                         theme::paint_icon(
@@ -184,7 +191,8 @@ fn my_status_row(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
         || app.active_story_contact.as_deref() == Some("me");
 
     let row_height = 64.0;
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click());
 
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -192,7 +200,8 @@ fn my_status_row(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
 
     if response.clicked() {
         if has_stories {
-            app.actions.push(Action::SelectStoryContact(sender_for_viewer.clone()));
+            app.actions
+                .push(Action::SelectStoryContact(sender_for_viewer.clone()));
         } else {
             app.actions.push(Action::OpenPostStory);
         }
@@ -200,9 +209,11 @@ fn my_status_row(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
 
     if ui.is_rect_visible(rect) {
         if is_selected {
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, palette.surface_hover);
+            ui.painter()
+                .rect_filled(rect, CornerRadius::ZERO, palette.surface_hover);
         } else if response.hovered() {
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, palette.surface);
+            ui.painter()
+                .rect_filled(rect, CornerRadius::ZERO, palette.surface);
         }
 
         // Avatar with ring or plus badge
@@ -220,7 +231,8 @@ fn my_status_row(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
         }
 
         ui.scope_builder(
-            egui::UiBuilder::new().max_rect(Rect::from_center_size(avatar_center, vec2(42.0, 42.0))),
+            egui::UiBuilder::new()
+                .max_rect(Rect::from_center_size(avatar_center, vec2(42.0, 42.0))),
             |ui| {
                 widgets::avatar(ui, palette, &me_name, &me, 42.0, picture.as_deref());
             },
@@ -229,7 +241,8 @@ fn my_status_row(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
         if !has_stories {
             let badge_pos = pos2(avatar_center.x + 14.0, avatar_center.y + 14.0);
             ui.painter().circle_filled(badge_pos, 8.0, palette.panel);
-            ui.painter().circle_filled(badge_pos, 7.0, Color32::from_rgb(0, 168, 132));
+            ui.painter()
+                .circle_filled(badge_pos, 7.0, Color32::from_rgb(0, 168, 132));
             ui.painter().text(
                 badge_pos + vec2(0.0, -1.0),
                 Align2::CENTER_CENTER,
@@ -285,7 +298,11 @@ fn my_status_row(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
                     app.actions.push(Action::RevokeStory(id.clone()));
                 }
             }
-            let tint = if trash_resp.hovered() { palette.danger } else { palette.secondary };
+            let tint = if trash_resp.hovered() {
+                palette.danger
+            } else {
+                palette.secondary
+            };
             theme::paint_icon(ui, Icon::Trash, trash_rect, 16.0, tint);
             trash_resp.on_hover_text("Delete status");
         }
@@ -301,21 +318,25 @@ fn contact_status_row(
 ) {
     let is_selected = app.active_story_contact.as_deref() == Some(&contact.sender);
     let row_height = 64.0;
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click());
 
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
     if response.clicked() {
-        app.actions.push(Action::SelectStoryContact(contact.sender.clone()));
+        app.actions
+            .push(Action::SelectStoryContact(contact.sender.clone()));
     }
 
     if ui.is_rect_visible(rect) {
         if is_selected {
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, palette.surface_hover);
+            ui.painter()
+                .rect_filled(rect, CornerRadius::ZERO, palette.surface_hover);
         } else if response.hovered() {
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, palette.surface);
+            ui.painter()
+                .rect_filled(rect, CornerRadius::ZERO, palette.surface);
         }
 
         // Avatar with status ring
@@ -326,15 +347,13 @@ fn contact_status_row(
             palette.dim // Viewed gray
         };
 
-        ui.painter().circle_stroke(
-            avatar_center,
-            24.0,
-            Stroke::new(2.2, ring_color),
-        );
+        ui.painter()
+            .circle_stroke(avatar_center, 24.0, Stroke::new(2.2, ring_color));
 
         let picture = app.avatar(&contact.sender);
         ui.scope_builder(
-            egui::UiBuilder::new().max_rect(Rect::from_center_size(avatar_center, vec2(42.0, 42.0))),
+            egui::UiBuilder::new()
+                .max_rect(Rect::from_center_size(avatar_center, vec2(42.0, 42.0))),
             |ui| {
                 widgets::avatar(
                     ui,
@@ -387,7 +406,8 @@ fn empty_placeholder(app: &App, ui: &mut egui::Ui) {
     let palette = app.palette;
     let rect = ui.available_rect_before_wrap();
 
-    ui.painter().rect_filled(rect, CornerRadius::ZERO, palette.panel);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, palette.panel);
 
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         ui.vertical_centered(|ui| {
@@ -398,19 +418,14 @@ fn empty_placeholder(app: &App, ui: &mut egui::Ui) {
 
             // Large circle with Status icon
             let icon_circle_size = 96.0;
-            let (circle_rect, _) = ui.allocate_exact_size(vec2(icon_circle_size, icon_circle_size), Sense::hover());
+            let (circle_rect, _) =
+                ui.allocate_exact_size(vec2(icon_circle_size, icon_circle_size), Sense::hover());
             ui.painter().circle_filled(
                 circle_rect.center(),
                 icon_circle_size / 2.0,
                 palette.surface_hover,
             );
-            theme::paint_icon(
-                ui,
-                Icon::Status,
-                circle_rect,
-                48.0,
-                palette.accent,
-            );
+            theme::paint_icon(ui, Icon::Status, circle_rect, 48.0, palette.accent);
 
             ui.add_space(20.0);
 

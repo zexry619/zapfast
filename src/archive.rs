@@ -1986,10 +1986,8 @@ impl Archive {
                 params![chat, p.message_id, p.sender, p.timestamp, p.expires_at, p.preview],
             )?;
         } else {
-            self.connection.execute(
-                "DELETE FROM pinned_messages WHERE chat = ?1",
-                params![chat],
-            )?;
+            self.connection
+                .execute("DELETE FROM pinned_messages WHERE chat = ?1", params![chat])?;
         }
         Ok(())
     }

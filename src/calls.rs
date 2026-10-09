@@ -613,7 +613,16 @@ impl CameraCapture {
             .name("zapfast-camera".to_owned())
             .spawn(move || {
                 let _alive = alive;
-                capture(Some(device), frames, ticks, slot, stopping, keyframing, bitrates, ready);
+                capture(
+                    Some(device),
+                    frames,
+                    ticks,
+                    slot,
+                    stopping,
+                    keyframing,
+                    bitrates,
+                    ready,
+                );
             })
             .context("camera thread could not be started")?;
         match came_up.recv_timeout(CAMERA_STARTUP) {
@@ -830,7 +839,11 @@ impl VideoPipeline {
         }
         self.device = device.clone();
         self.is_screen_sharing = false;
-        self.camera = Some(CameraCapture::start(device, self.ticks.clone(), self.frames_tx.clone())?);
+        self.camera = Some(CameraCapture::start(
+            device,
+            self.ticks.clone(),
+            self.frames_tx.clone(),
+        )?);
         Ok(())
     }
 
@@ -844,11 +857,21 @@ impl VideoPipeline {
         }
         if on {
             log::info!("[CALL] switching local video stream to Screen Share");
-            self.camera = Some(CameraCapture::start_screen(self.ticks.clone(), self.frames_tx.clone())?);
+            self.camera = Some(CameraCapture::start_screen(
+                self.ticks.clone(),
+                self.frames_tx.clone(),
+            )?);
             self.is_screen_sharing = true;
         } else {
-            log::info!("[CALL] switching local video stream to Camera ({:?})", self.device);
-            self.camera = Some(CameraCapture::start(self.device.clone(), self.ticks.clone(), self.frames_tx.clone())?);
+            log::info!(
+                "[CALL] switching local video stream to Camera ({:?})",
+                self.device
+            );
+            self.camera = Some(CameraCapture::start(
+                self.device.clone(),
+                self.ticks.clone(),
+                self.frames_tx.clone(),
+            )?);
             self.is_screen_sharing = false;
         }
         self.request_keyframe();
@@ -892,13 +915,13 @@ impl VideoPipeline {
 pub fn target_bitrate_for_size(width: usize, height: usize) -> u32 {
     let pixels = width * height;
     if pixels >= 1280 * 720 {
-        450_000   // 450 kbps for 720p HD (fits mobile bandwidth without congestion)
+        450_000 // 450 kbps for 720p HD (fits mobile bandwidth without congestion)
     } else if pixels >= 800 * 600 {
-        350_000   // 350 kbps for SVGA
+        350_000 // 350 kbps for SVGA
     } else if pixels >= 640 * 360 {
-        250_000   // 250 kbps for 360p/VGA (resilient, smooth, fits mobile bandwidth)
+        250_000 // 250 kbps for 360p/VGA (resilient, smooth, fits mobile bandwidth)
     } else {
-        160_000   // 160 kbps for lower resolutions
+        160_000 // 160 kbps for lower resolutions
     }
 }
 
@@ -918,8 +941,8 @@ fn capture(
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     use openh264::encoder::{
-        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile,
-        QpRange, RateControlMode, UsageType,
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile, QpRange,
+        RateControlMode, UsageType,
     };
 
     let Some(device) = device else {
@@ -995,8 +1018,8 @@ fn capture_screen(
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
     use openh264::encoder::{
-        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile,
-        QpRange, RateControlMode, UsageType,
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile, QpRange,
+        RateControlMode, UsageType,
     };
 
     let budget = (1280, 720);
@@ -1149,7 +1172,10 @@ fn capture_frames(
         read_us_acc += read_dur.as_micros() as u64;
         let max_expected_read_ms = (1000 / VIDEO_FPS as u128) + 50;
         if read_dur.as_millis() > max_expected_read_ms {
-            log::warn!("[CALL][CAM] slow camera read: took {}ms", read_dur.as_millis());
+            log::warn!(
+                "[CALL][CAM] slow camera read: took {}ms",
+                read_dur.as_millis()
+            );
         }
 
         let luma = &bytes[..luma_len];
@@ -1284,7 +1310,10 @@ fn capture_frames(
         let enc_dur = t_enc_start.elapsed();
         enc_us_acc += enc_dur.as_micros() as u64;
         if enc_dur.as_millis() > 30 {
-            log::warn!("[CALL][CAM] slow h264 encode: took {}ms", enc_dur.as_millis());
+            log::warn!(
+                "[CALL][CAM] slow h264 encode: took {}ms",
+                enc_dur.as_millis()
+            );
         }
 
         frames_in_sec += 1;

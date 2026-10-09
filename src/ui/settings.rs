@@ -507,7 +507,8 @@ fn sections(app: &App) -> Vec<Section> {
                     for mic in &app.call_devices.microphones {
                         let selected = app.settings.call_microphone.as_deref() == Some(&mic.id);
                         if theme_option(ui, &palette, &mic.label, selected) {
-                            app.actions.push(Action::SetCallMicrophone(Some(mic.id.clone())));
+                            app.actions
+                                .push(Action::SetCallMicrophone(Some(mic.id.clone())));
                         }
                     }
                 });
@@ -544,7 +545,8 @@ fn sections(app: &App) -> Vec<Section> {
                     for speaker in &app.call_devices.speakers {
                         let selected = app.settings.call_speaker.as_deref() == Some(&speaker.id);
                         if theme_option(ui, &palette, &speaker.label, selected) {
-                            app.actions.push(Action::SetCallSpeaker(Some(speaker.id.clone())));
+                            app.actions
+                                .push(Action::SetCallSpeaker(Some(speaker.id.clone())));
                         }
                     }
                 });
@@ -581,7 +583,8 @@ fn sections(app: &App) -> Vec<Section> {
                     for camera in &app.call_devices.cameras {
                         let selected = app.settings.call_camera.as_deref() == Some(&camera.id);
                         if theme_option(ui, &palette, &camera.label, selected) {
-                            app.actions.push(Action::SetCallCameraDevice(Some(camera.id.clone())));
+                            app.actions
+                                .push(Action::SetCallCameraDevice(Some(camera.id.clone())));
                         }
                     }
                 });
@@ -591,7 +594,10 @@ fn sections(app: &App) -> Vec<Section> {
 
     calls.row(
         translated(locale, "Device detection"),
-        translated(locale, "Scan for newly connected cameras, microphones, or headsets."),
+        translated(
+            locale,
+            "Scan for newly connected cameras, microphones, or headsets.",
+        ),
         move |ui, app| {
             if theme::soft_button(
                 ui,

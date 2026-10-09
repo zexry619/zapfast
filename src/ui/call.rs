@@ -75,7 +75,16 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         if call.phase == CallPhase::Incoming {
                             ringing(ui, app, &call, &peer, picture.as_deref(), &palette, inner);
                         } else {
-                            live(ui, app, &call, &peer, picture.as_deref(), &palette, screen, inner);
+                            live(
+                                ui,
+                                app,
+                                &call,
+                                &peer,
+                                picture.as_deref(),
+                                &palette,
+                                screen,
+                                inner,
+                            );
                         }
                     });
                 });
@@ -335,7 +344,10 @@ fn call_texture(
                 *uploaded = Some(std::sync::Arc::clone(image));
                 let dur = t_start.elapsed();
                 if dur.as_millis() > 10 {
-                    log::warn!("[CALL][UI] slow GPU texture update for {name}: took {}ms", dur.as_millis());
+                    log::warn!(
+                        "[CALL][UI] slow GPU texture update for {name}: took {}ms",
+                        dur.as_millis()
+                    );
                 }
             }
             texture.id()
@@ -349,7 +361,10 @@ fn call_texture(
             let id = texture.id();
             *kept = Some(texture);
             *uploaded = Some(std::sync::Arc::clone(image));
-            log::info!("[CALL][UI] loaded new GPU texture for {name}: size={:?}", image.size);
+            log::info!(
+                "[CALL][UI] loaded new GPU texture for {name}: size={:?}",
+                image.size
+            );
             id
         }
     }
@@ -562,131 +577,128 @@ fn controls(ui: &mut egui::Ui, app: &mut App, call: &CallUpdate, palette: &Palet
             } else {
                 gettext(locale, "Mute").into_owned()
             };
-        let response = control(
-            ui,
-            if call.muted {
-                Icon::VolumeX
-            } else {
-                Icon::Mic
-            },
-            CONTROL,
-            if call.muted {
-                palette.danger
-            } else {
-                palette.surface_active
-            },
-            palette.text,
-            &tip,
-            connected,
-        );
-        if response.clicked() {
-            app.actions.push(Action::SetCallMuted(!call.muted));
-        }
-
-        // Camera: starts video on a voice call, and stops sending our picture on a video call. Only
-        // where the backend can really carry video, so macOS and Windows do not offer a control
-        // whose only possible outcome is a backend error; the chat header gates on the same flag.
-        if video {
-            let tip = if !call.video {
-                gettext(locale, "Start video").into_owned()
-            } else if call.camera_on {
-                gettext(locale, "Turn the camera off").into_owned()
-            } else {
-                gettext(locale, "Turn the camera on").into_owned()
-            };
             let response = control(
                 ui,
-                Icon::Video,
+                if call.muted { Icon::VolumeX } else { Icon::Mic },
                 CONTROL,
-                if call.camera_on {
-                    palette.accent
+                if call.muted {
+                    palette.danger
                 } else {
                     palette.surface_active
                 },
-                if call.camera_on {
-                    palette.on_accent
-                } else {
-                    palette.text
-                },
+                palette.text,
                 &tip,
                 connected,
             );
             if response.clicked() {
-                app.actions.push(Action::SetCallCamera(!call.camera_on));
+                app.actions.push(Action::SetCallMuted(!call.muted));
             }
-        }
 
-        // Screen sharing: captures desktop screen and transmits over the video RTP plane.
-        if call.video {
-            let supported = crate::calls::screen_share_supported();
-            let tip = if call.screen_sharing {
-                gettext(locale, "Stop sharing screen").into_owned()
-            } else {
-                gettext(locale, "Share your screen").into_owned()
-            };
+            // Camera: starts video on a voice call, and stops sending our picture on a video call. Only
+            // where the backend can really carry video, so macOS and Windows do not offer a control
+            // whose only possible outcome is a backend error; the chat header gates on the same flag.
+            if video {
+                let tip = if !call.video {
+                    gettext(locale, "Start video").into_owned()
+                } else if call.camera_on {
+                    gettext(locale, "Turn the camera off").into_owned()
+                } else {
+                    gettext(locale, "Turn the camera on").into_owned()
+                };
+                let response = control(
+                    ui,
+                    Icon::Video,
+                    CONTROL,
+                    if call.camera_on {
+                        palette.accent
+                    } else {
+                        palette.surface_active
+                    },
+                    if call.camera_on {
+                        palette.on_accent
+                    } else {
+                        palette.text
+                    },
+                    &tip,
+                    connected,
+                );
+                if response.clicked() {
+                    app.actions.push(Action::SetCallCamera(!call.camera_on));
+                }
+            }
+
+            // Screen sharing: captures desktop screen and transmits over the video RTP plane.
+            if call.video {
+                let supported = crate::calls::screen_share_supported();
+                let tip = if call.screen_sharing {
+                    gettext(locale, "Stop sharing screen").into_owned()
+                } else {
+                    gettext(locale, "Share your screen").into_owned()
+                };
+                let response = control(
+                    ui,
+                    Icon::Monitor,
+                    CONTROL,
+                    if call.screen_sharing {
+                        palette.accent
+                    } else {
+                        palette.surface_active
+                    },
+                    if call.screen_sharing {
+                        palette.on_accent
+                    } else {
+                        palette.text
+                    },
+                    &tip,
+                    supported && connected,
+                );
+                if response.clicked() {
+                    app.actions
+                        .push(Action::SetCallScreenShare(!call.screen_sharing));
+                }
+            }
+
+            // The speaker button shows and hides the device pickers below it.
+            let tip = gettext(locale, "Speaker and devices").into_owned();
             let response = control(
                 ui,
-                Icon::Monitor,
+                Icon::Volume2,
                 CONTROL,
-                if call.screen_sharing {
+                if app.call_devices_open {
                     palette.accent
                 } else {
                     palette.surface_active
                 },
-                if call.screen_sharing {
+                if app.call_devices_open {
                     palette.on_accent
                 } else {
                     palette.text
                 },
                 &tip,
-                supported && connected,
+                live,
             );
             if response.clicked() {
-                app.actions
-                    .push(Action::SetCallScreenShare(!call.screen_sharing));
+                app.call_devices_open = !app.call_devices_open;
             }
-        }
 
-        // The speaker button shows and hides the device pickers below it.
-        let tip = gettext(locale, "Speaker and devices").into_owned();
-        let response = control(
-            ui,
-            Icon::Volume2,
-            CONTROL,
-            if app.call_devices_open {
-                palette.accent
-            } else {
-                palette.surface_active
-            },
-            if app.call_devices_open {
-                palette.on_accent
-            } else {
-                palette.text
-            },
-            &tip,
-            live,
-        );
-        if response.clicked() {
-            app.call_devices_open = !app.call_devices_open;
-        }
-
-        // Hang up belongs to a call that is still up. The farewell screen keeps the controls it
-        // was drawn with, but this one is no longer actionable: the backend has already released
-        // the call, so a click would only send a command nobody is listening for.
-        let tip = gettext(locale, "Hang up").into_owned();
-        let response = control(
-            ui,
-            Icon::Phone,
-            CONTROL,
-            palette.danger,
-            Color32::WHITE,
-            &tip,
-            live,
-        );
-        if response.clicked() {
-            app.actions.push(Action::HangupCall);
-        }
-    });
+            // Hang up belongs to a call that is still up. The farewell screen keeps the controls it
+            // was drawn with, but this one is no longer actionable: the backend has already released
+            // the call, so a click would only send a command nobody is listening for.
+            let tip = gettext(locale, "Hang up").into_owned();
+            let response = control(
+                ui,
+                Icon::Phone,
+                CONTROL,
+                palette.danger,
+                Color32::WHITE,
+                &tip,
+                live,
+            );
+            if response.clicked() {
+                app.actions.push(Action::HangupCall);
+            }
+        },
+    );
 }
 
 /// One round control. A disabled control still reads as a control rather than disappearing.

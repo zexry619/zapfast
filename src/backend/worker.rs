@@ -58,8 +58,8 @@ use crate::app::PAGE;
 use crate::archive::Archive;
 use crate::model::{
     ATTACHMENT_DOWNLOAD_LIMIT, CallLogEntry, CallLogStatus, Chat, ChatId, ChatKind, Contact,
-    Content, Delivery, Gif, GifError, LIVE_LOCATION_LIMIT, LinkPreview, Media, MentionRef,
-    Message, PinnedMessage, Quoted, Reaction,
+    Content, Delivery, Gif, GifError, LIVE_LOCATION_LIMIT, LinkPreview, Media, MentionRef, Message,
+    PinnedMessage, Quoted, Reaction,
 };
 use crate::paths::AccountDirs;
 use crate::privacy::{self, PrivacyChoice, PrivacyKind};
@@ -2578,12 +2578,15 @@ impl Worker {
                         if let Err(e) = status_client.presence().subscribe(status_jid).await {
                             log::warn!("failed to subscribe to status@broadcast presence: {e}");
                         } else {
-                            log::info!("successfully subscribed to status@broadcast presence updates");
+                            log::info!(
+                                "successfully subscribed to status@broadcast presence updates"
+                            );
                         }
                         if let Some(contacts) = contacts_res {
                             for c in contacts {
                                 if let Ok(jid) = c.id.parse::<Jid>() {
-                                    let is_me = me_pn_sub.as_deref() == Some(&c.id) || me_lid_sub.as_deref() == Some(&c.id);
+                                    let is_me = me_pn_sub.as_deref() == Some(&c.id)
+                                        || me_lid_sub.as_deref() == Some(&c.id);
                                     if (jid.is_pn() || jid.is_lid()) && !is_me {
                                         let _ = status_client.presence().subscribe(jid).await;
                                     }
@@ -2870,7 +2873,10 @@ impl Worker {
                     peer: canonical_peer,
                     peer_name: None,
                     from_me: sync.from_me,
-                    timestamp: sync.record.start_time.unwrap_or_else(|| sync.timestamp.timestamp()),
+                    timestamp: sync
+                        .record
+                        .start_time
+                        .unwrap_or_else(|| sync.timestamp.timestamp()),
                     duration: sync.record.duration.unwrap_or(0).max(0) as i64,
                     is_video: sync.record.is_video.unwrap_or(false),
                     status,
@@ -2906,11 +2912,10 @@ impl Worker {
                     Some(wa::call_log_record::CallResult::Failed) => CallLogStatus::Failed,
                     _ => CallLogStatus::Other,
                 };
-                let call_id = history
-                    .record
-                    .call_id
-                    .clone()
-                    .unwrap_or_else(|| format!("hist_{}", history.record.start_time.unwrap_or(0)));
+                let call_id =
+                    history.record.call_id.clone().unwrap_or_else(|| {
+                        format!("hist_{}", history.record.start_time.unwrap_or(0))
+                    });
                 let entry = CallLogEntry {
                     call_id,
                     peer: canonical_peer,
@@ -3359,7 +3364,12 @@ impl Worker {
         } else {
             self.canonical(&info.source.sender)
         };
-        log::info!("Handling status broadcast: id={}, sender={}, from_me={}", info.id, sender, from_me);
+        log::info!(
+            "Handling status broadcast: id={}, sender={}, from_me={}",
+            info.id,
+            sender,
+            from_me
+        );
         let sender_name = if from_me {
             Some("You".to_string())
         } else {
@@ -3430,7 +3440,8 @@ impl Worker {
                 tokio::spawn(async move {
                     let result = with_attachment_deadline(ATTACHMENT_TIMEOUT, async {
                         download_attachment(&client, &*dl, &dest_dir, &dest_path).await
-                    }).await;
+                    })
+                    .await;
                     match result {
                         Ok(p) => {
                             log::info!("Downloaded story media for {}: {:?}", story_id, p);
@@ -3464,11 +3475,19 @@ impl Worker {
                 raw_message: Some(message.encode_to_vec()),
                 viewed: from_me,
             };
-            log::info!("Emitting StoryReceived: id={}, sender={}, has_text={}, media_type={:?}",
-                story_item.id, story_item.sender, story_item.text.is_some(), story_item.media_type);
+            log::info!(
+                "Emitting StoryReceived: id={}, sender={}, has_text={}, media_type={:?}",
+                story_item.id,
+                story_item.sender,
+                story_item.text.is_some(),
+                story_item.media_type
+            );
             self.emit(Event::StoryReceived(Box::new(story_item)));
         } else {
-            log::debug!("Status broadcast without displayable text or media ignored: id={}", id);
+            log::debug!(
+                "Status broadcast without displayable text or media ignored: id={}",
+                id
+            );
         }
     }
 
@@ -3567,7 +3586,8 @@ impl Worker {
                 tokio::spawn(async move {
                     let result = with_attachment_deadline(ATTACHMENT_TIMEOUT, async {
                         download_attachment(&client, &*dl, &dest_dir, &dest_path).await
-                    }).await;
+                    })
+                    .await;
                     match result {
                         Ok(p) => {
                             log::info!("Downloaded history story media for {}: {:?}", story_id, p);
@@ -3578,7 +3598,11 @@ impl Worker {
                             waker.wake();
                         }
                         Err(e) => {
-                            log::warn!("Failed to download history story media {}: {}", story_id, e);
+                            log::warn!(
+                                "Failed to download history story media {}: {}",
+                                story_id,
+                                e
+                            );
                         }
                     }
                 });
@@ -3601,7 +3625,11 @@ impl Worker {
                 raw_message: Some(message.raw.clone()),
                 viewed: from_me,
             };
-            log::info!("Ingested history status from {}: id={}", story_item.sender, story_item.id);
+            log::info!(
+                "Ingested history status from {}: id={}",
+                story_item.sender,
+                story_item.id
+            );
             self.emit(Event::StoryReceived(Box::new(story_item)));
         }
     }
@@ -6560,7 +6588,9 @@ impl Worker {
                 }
                 let recipients: Vec<Jid> = recipient_set.into_iter().collect();
                 if recipients.is_empty() {
-                    self.emit(Event::StoryPosted(Err("No contacts found to share status with".into())));
+                    self.emit(Event::StoryPosted(Err(
+                        "No contacts found to share status with".into(),
+                    )));
                     return;
                 }
                 let font_enum = match font {
@@ -6625,7 +6655,9 @@ impl Worker {
                 }
                 let recipients: Vec<Jid> = recipient_set.into_iter().collect();
                 if recipients.is_empty() {
-                    self.emit(Event::StoryPosted(Err("No contacts found to share status with".into())));
+                    self.emit(Event::StoryPosted(Err(
+                        "No contacts found to share status with".into(),
+                    )));
                     return;
                 }
                 let events = self.events.clone();
@@ -6636,16 +6668,21 @@ impl Worker {
                         .await;
                     match upload_res {
                         Ok(upload) => {
-                            let thumb = image::load_from_memory(&bytes).ok().and_then(|img| {
-                                thumbnail_jpeg(&img)
-                            }).unwrap_or_default();
-                            match client.status().send_image(
-                                upload,
-                                thumb,
-                                caption.as_deref(),
-                                &recipients,
-                                Default::default(),
-                            ).await {
+                            let thumb = image::load_from_memory(&bytes)
+                                .ok()
+                                .and_then(|img| thumbnail_jpeg(&img))
+                                .unwrap_or_default();
+                            match client
+                                .status()
+                                .send_image(
+                                    upload,
+                                    thumb,
+                                    caption.as_deref(),
+                                    &recipients,
+                                    Default::default(),
+                                )
+                                .await
+                            {
                                 Ok(_) => {
                                     let _ = events.send(Event::StoryPosted(Ok(())));
                                 }
@@ -6689,7 +6726,9 @@ impl Worker {
                 }
                 let recipients: Vec<Jid> = recipient_set.into_iter().collect();
                 if recipients.is_empty() {
-                    self.emit(Event::StoryPosted(Err("No contacts found to share status with".into())));
+                    self.emit(Event::StoryPosted(Err(
+                        "No contacts found to share status with".into(),
+                    )));
                     return;
                 }
                 let events = self.events.clone();
@@ -6698,7 +6737,9 @@ impl Worker {
                     let bytes = match tokio::fs::read(&path).await {
                         Ok(b) => b,
                         Err(e) => {
-                            let _ = events.send(Event::StoryPosted(Err(format!("Could not read video: {e}"))));
+                            let _ = events.send(Event::StoryPosted(Err(format!(
+                                "Could not read video: {e}"
+                            ))));
                             waker.wake();
                             return;
                         }
@@ -6713,7 +6754,9 @@ impl Worker {
                     let thumb = poster
                         .as_ref()
                         .and_then(|poster| poster.picture.clone())
-                        .and_then(|picture| thumbnail_jpeg(&image::DynamicImage::ImageRgb8(picture)))
+                        .and_then(|picture| {
+                            thumbnail_jpeg(&image::DynamicImage::ImageRgb8(picture))
+                        })
                         .unwrap_or_default();
                     let seconds = poster.as_ref().map(|poster| poster.seconds).unwrap_or(0);
 
@@ -6722,14 +6765,18 @@ impl Worker {
                         .await;
                     match upload_res {
                         Ok(upload) => {
-                            match client.status().send_video(
-                                upload,
-                                thumb,
-                                seconds,
-                                caption.as_deref(),
-                                &recipients,
-                                Default::default(),
-                            ).await {
+                            match client
+                                .status()
+                                .send_video(
+                                    upload,
+                                    thumb,
+                                    seconds,
+                                    caption.as_deref(),
+                                    &recipients,
+                                    Default::default(),
+                                )
+                                .await
+                            {
                                 Ok(_) => {
                                     let _ = events.send(Event::StoryPosted(Ok(())));
                                 }
@@ -6752,7 +6799,10 @@ impl Worker {
                     let ids = vec![id];
                     tokio::spawn(async move {
                         let ids_ref: Vec<&str> = ids.iter().map(String::as_str).collect();
-                        if let Err(error) = client.mark_as_read(&jid, sender_jid.as_ref(), &ids_ref).await {
+                        if let Err(error) = client
+                            .mark_as_read(&jid, sender_jid.as_ref(), &ids_ref)
+                            .await
+                        {
                             log::debug!("status read receipt not sent: {error}");
                         }
                     });
@@ -6845,7 +6895,12 @@ impl Worker {
                             } else {
                                 client
                                     .chat_actions()
-                                    .unstar_message(&chat_jid, participant_jid.as_ref(), &id, from_me)
+                                    .unstar_message(
+                                        &chat_jid,
+                                        participant_jid.as_ref(),
+                                        &id,
+                                        from_me,
+                                    )
                                     .await
                             };
                             if let Err(e) = res {
@@ -7026,11 +7081,16 @@ impl Worker {
                 {
                     tokio::spawn(async move {
                         if chat_jid.is_group() {
-                            if let Err(e) = client.groups().set_ephemeral(chat_jid, duration_secs).await {
+                            if let Err(e) =
+                                client.groups().set_ephemeral(chat_jid, duration_secs).await
+                            {
                                 log::warn!("Failed to set group ephemeral timer: {e:?}");
                             }
                         } else if chat_jid.is_pn() || chat_jid.is_lid() {
-                            if let Err(e) = client.set_chat_disappearing_timer(chat_jid, duration_secs).await {
+                            if let Err(e) = client
+                                .set_chat_disappearing_timer(chat_jid, duration_secs)
+                                .await
+                            {
                                 log::warn!("Failed to set chat disappearing timer: {e:?}");
                             }
                         }
@@ -7100,7 +7160,11 @@ impl Worker {
             let recipients: Vec<Jid> = recipient_set.into_iter().collect();
             let id_clone = id.clone();
             tokio::spawn(async move {
-                if let Err(e) = client.status().revoke(id_clone, &recipients, Default::default()).await {
+                if let Err(e) = client
+                    .status()
+                    .revoke(id_clone, &recipients, Default::default())
+                    .await
+                {
                     log::warn!("Failed to revoke status on WhatsApp: {e:?}");
                 }
             });
@@ -7117,7 +7181,9 @@ impl Worker {
         raw_message: Option<Vec<u8>>,
     ) {
         let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&sender)) else {
-            self.emit(Event::Error("Not connected to WhatsApp or invalid contact".to_owned()));
+            self.emit(Event::Error(
+                "Not connected to WhatsApp or invalid contact".to_owned(),
+            ));
             return;
         };
 
@@ -7148,9 +7214,13 @@ impl Worker {
         } else if let Some(ref txt) = base.conversation.as_deref() {
             txt.to_string()
         } else if let Some(ref img) = base.image_message.as_option() {
-            img.caption.clone().unwrap_or_else(|| "Status (Photo)".to_string())
+            img.caption
+                .clone()
+                .unwrap_or_else(|| "Status (Photo)".to_string())
         } else if let Some(ref vid) = base.video_message.as_option() {
-            vid.caption.clone().unwrap_or_else(|| "Status (Video)".to_string())
+            vid.caption
+                .clone()
+                .unwrap_or_else(|| "Status (Video)".to_string())
         } else {
             "Status".to_string()
         };
@@ -8578,7 +8648,12 @@ impl Worker {
         let commands = self.commands.clone();
         tokio::spawn(async move {
             if let Err(error) = client
-                .edit_message_raw(jid, id.clone(), message, whatsapp_rust::EditOptions::default())
+                .edit_message_raw(
+                    jid,
+                    id.clone(),
+                    message,
+                    whatsapp_rust::EditOptions::default(),
+                )
                 .await
             {
                 let _ = commands.send(Command::Sent {

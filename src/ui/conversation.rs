@@ -104,11 +104,19 @@ fn pinned_banner(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if resp.clicked() {
-                    app.actions.push(Action::ScrollTo(pinned.message_id.clone()));
+                    app.actions
+                        .push(Action::ScrollTo(pinned.message_id.clone()));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if theme::icon_button(ui, Icon::X, 14.0, palette.secondary, palette.text, "Unpin")
-                        .clicked()
+                    if theme::icon_button(
+                        ui,
+                        Icon::X,
+                        14.0,
+                        palette.secondary,
+                        palette.text,
+                        "Unpin",
+                    )
+                    .clicked()
                     {
                         app.actions.push(Action::UnpinMessage {
                             chat: chat.id.clone(),
@@ -197,10 +205,14 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                 // it, so it offers a new call rather than a Hang up that would do nothing.
                 let call_here = app.call_live_here(&chat.id);
                 let calls_here = crate::calls::capabilities();
-                let has_calls = chat.kind == crate::model::ChatKind::Direct
-                    && (calls_here.voice || call_here);
+                let has_calls =
+                    chat.kind == crate::model::ChatKind::Direct && (calls_here.voice || call_here);
                 let base_controls = if has_calls { 144.0 } else { 72.0 };
-                let right_controls = if narrow { base_controls + 36.0 } else { base_controls };
+                let right_controls = if narrow {
+                    base_controls + 36.0
+                } else {
+                    base_controls
+                };
                 // Treat the avatar, name, and subtitle as one info button.
                 let block = ui
                     .scope(|ui| {
@@ -375,13 +387,27 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                                         chat.id.clone(),
                                     )));
                             }
-                            if widgets::menu_item(ui, &palette, Some(Icon::Star), "Starred messages") {
-                                app.actions.push(Action::ShowDialog(Dialog::StarredMessages {
-                                    chat: Some(chat.id.clone()),
-                                }));
+                            if widgets::menu_item(
+                                ui,
+                                &palette,
+                                Some(Icon::Star),
+                                "Starred messages",
+                            ) {
+                                app.actions
+                                    .push(Action::ShowDialog(Dialog::StarredMessages {
+                                        chat: Some(chat.id.clone()),
+                                    }));
                             }
-                            if widgets::menu_item(ui, &palette, Some(Icon::Timer), "Disappearing messages") {
-                                app.actions.push(Action::ShowDialog(Dialog::DisappearingMessages(chat.id.clone())));
+                            if widgets::menu_item(
+                                ui,
+                                &palette,
+                                Some(Icon::Timer),
+                                "Disappearing messages",
+                            ) {
+                                app.actions
+                                    .push(Action::ShowDialog(Dialog::DisappearingMessages(
+                                        chat.id.clone(),
+                                    )));
                             }
                             if !chat.is_group() && !chat.is_channel() {
                                 let is_blocked = app.blocked_contacts.contains(&chat.id);
@@ -4016,8 +4042,10 @@ fn footer_over_picture(
     });
     let tick_width = if message.from_me { 19.0 } else { 0.0 };
     let star_width = if message.starred { 14.0 } else { 0.0 };
-    let width =
-        time.size().x + failed.as_ref().map_or(0.0, |galley| galley.size().x + 6.0) + tick_width + star_width;
+    let width = time.size().x
+        + failed.as_ref().map_or(0.0, |galley| galley.size().x + 6.0)
+        + tick_width
+        + star_width;
     let row = Rect::from_min_max(
         pos2(
             picture.right() - OVER_PICTURE_INSET.x - width,

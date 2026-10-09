@@ -1,14 +1,13 @@
 //! Calls dedicated page: sidebar call history list and main detail pane.
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, Sense, Vec2,
-    pos2, vec2,
+    Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, Sense, Vec2, pos2, vec2,
 };
 
+use super::widgets;
 use crate::app::App;
 use crate::model::{Action, CallLogEntry, CallLogStatus};
 use crate::theme::{self, Icon, Palette};
-use super::widgets;
 
 pub fn sidebar(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
@@ -136,7 +135,12 @@ fn filter_chips(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
                 ui.spacing_mut().item_spacing = vec2(6.0, 0.0);
 
                 let all_selected = !app.calls_filter_missed;
-                if chip_button(ui, palette, &crate::i18n::gettext(app.locale, "All"), all_selected) {
+                if chip_button(
+                    ui,
+                    palette,
+                    &crate::i18n::gettext(app.locale, "All"),
+                    all_selected,
+                ) {
                     if app.calls_filter_missed {
                         app.actions.push(Action::ToggleCallsFilterMissed);
                     }
@@ -174,11 +178,8 @@ fn chip_button(ui: &mut egui::Ui, palette: &Palette, label: &str, selected: bool
         };
 
         ui.painter().rect_filled(rect, CornerRadius::same(14), bg);
-        ui.painter().galley(
-            rect.center() - galley.size() / 2.0,
-            galley,
-            text_color,
-        );
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, text_color);
     }
 
     response.clicked()
@@ -187,21 +188,25 @@ fn chip_button(ui: &mut egui::Ui, palette: &Palette, label: &str, selected: bool
 fn call_log_row(app: &mut App, ui: &mut egui::Ui, palette: &Palette, entry: &CallLogEntry) {
     let is_selected = app.active_call_log.as_deref() == Some(&entry.call_id);
     let row_height = 64.0;
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click());
 
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
     if response.clicked() {
-        app.actions.push(Action::SelectCallLog(entry.call_id.clone()));
+        app.actions
+            .push(Action::SelectCallLog(entry.call_id.clone()));
     }
 
     if ui.is_rect_visible(rect) {
         if is_selected {
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, palette.surface_hover);
+            ui.painter()
+                .rect_filled(rect, CornerRadius::ZERO, palette.surface_hover);
         } else if response.hovered() {
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, palette.surface);
+            ui.painter()
+                .rect_filled(rect, CornerRadius::ZERO, palette.surface);
         }
 
         // Contact Avatar
@@ -210,7 +215,8 @@ fn call_log_row(app: &mut App, ui: &mut egui::Ui, palette: &Palette, entry: &Cal
         let picture = app.avatar(&entry.peer);
 
         ui.scope_builder(
-            egui::UiBuilder::new().max_rect(Rect::from_center_size(avatar_center, vec2(40.0, 40.0))),
+            egui::UiBuilder::new()
+                .max_rect(Rect::from_center_size(avatar_center, vec2(40.0, 40.0))),
             |ui| {
                 widgets::avatar(ui, palette, name, &entry.peer, 40.0, picture.as_deref());
             },
@@ -257,7 +263,11 @@ fn call_log_row(app: &mut App, ui: &mut egui::Ui, palette: &Palette, entry: &Cal
             Align2::LEFT_CENTER,
             &detail_str,
             theme::regular(12.0),
-            if entry.status == CallLogStatus::Missed { arrow_color } else { palette.secondary },
+            if entry.status == CallLogStatus::Missed {
+                arrow_color
+            } else {
+                palette.secondary
+            },
         );
 
         // Direct call buttons on right
@@ -275,10 +285,22 @@ fn call_log_row(app: &mut App, ui: &mut egui::Ui, palette: &Palette, entry: &Cal
             }
         }
 
-        let icon = if entry.is_video { Icon::Video } else { Icon::Phone };
-        let icon_color = if phone_resp.hovered() { palette.accent } else { palette.secondary };
+        let icon = if entry.is_video {
+            Icon::Video
+        } else {
+            Icon::Phone
+        };
+        let icon_color = if phone_resp.hovered() {
+            palette.accent
+        } else {
+            palette.secondary
+        };
         theme::paint_icon(ui, icon, phone_rect, 16.0, icon_color);
-        phone_resp.on_hover_text(if entry.is_video { "Start video call" } else { "Start voice call" });
+        phone_resp.on_hover_text(if entry.is_video {
+            "Start video call"
+        } else {
+            "Start voice call"
+        });
     }
 }
 
@@ -299,7 +321,8 @@ fn detail_panel(app: &mut App, ui: &mut egui::Ui, entry: &CallLogEntry) {
     let palette = app.palette;
     let rect = ui.available_rect_before_wrap();
 
-    ui.painter().rect_filled(rect, CornerRadius::ZERO, palette.panel);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, palette.panel);
 
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         egui::ScrollArea::vertical()
@@ -312,13 +335,18 @@ fn detail_panel(app: &mut App, ui: &mut egui::Ui, entry: &CallLogEntry) {
                 let picture = app.avatar(&entry.peer);
                 ui.vertical_centered(|ui| {
                     let avatar_size = 80.0;
-                    let (avatar_rect, _) = ui.allocate_exact_size(Vec2::splat(avatar_size), Sense::hover());
-                    ui.scope_builder(
-                        egui::UiBuilder::new().max_rect(avatar_rect),
-                        |ui| {
-                            widgets::avatar(ui, &palette, name, &entry.peer, avatar_size, picture.as_deref());
-                        },
-                    );
+                    let (avatar_rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(avatar_size), Sense::hover());
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(avatar_rect), |ui| {
+                        widgets::avatar(
+                            ui,
+                            &palette,
+                            name,
+                            &entry.peer,
+                            avatar_size,
+                            picture.as_deref(),
+                        );
+                    });
 
                     ui.add_space(14.0);
 
@@ -339,17 +367,35 @@ fn detail_panel(app: &mut App, ui: &mut egui::Ui, entry: &CallLogEntry) {
                         ui.add_space(pad);
 
                         // Voice Call Button
-                        if action_pill_button(ui, &palette, Icon::Phone, "Voice Call", palette.accent) {
+                        if action_pill_button(
+                            ui,
+                            &palette,
+                            Icon::Phone,
+                            "Voice Call",
+                            palette.accent,
+                        ) {
                             app.actions.push(Action::StartCall(entry.peer.clone()));
                         }
 
                         // Video Call Button
-                        if action_pill_button(ui, &palette, Icon::Video, "Video Call", palette.accent) {
+                        if action_pill_button(
+                            ui,
+                            &palette,
+                            Icon::Video,
+                            "Video Call",
+                            palette.accent,
+                        ) {
                             app.actions.push(Action::StartVideoCall(entry.peer.clone()));
                         }
 
                         // Message Button
-                        if action_pill_button(ui, &palette, Icon::MessageCircle, "Message", palette.secondary) {
+                        if action_pill_button(
+                            ui,
+                            &palette,
+                            Icon::MessageCircle,
+                            "Message",
+                            palette.secondary,
+                        ) {
                             app.actions.push(Action::OpenChat(entry.peer.clone()));
                         }
                     });
@@ -387,10 +433,21 @@ fn detail_panel(app: &mut App, ui: &mut egui::Ui, entry: &CallLogEntry) {
 
                             let stamp = crate::util::chat_stamp(app.locale, item.timestamp);
                             let dur = format_duration(item.duration);
-                            let media_type = if item.is_video { "Video Call" } else { "Voice Call" };
+                            let media_type = if item.is_video {
+                                "Video Call"
+                            } else {
+                                "Voice Call"
+                            };
 
-                            let (row_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
-                            ui.painter().rect_filled(row_rect, CornerRadius::same(6), palette.surface);
+                            let (row_rect, _) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), 44.0),
+                                Sense::hover(),
+                            );
+                            ui.painter().rect_filled(
+                                row_rect,
+                                CornerRadius::same(6),
+                                palette.surface,
+                            );
 
                             let left_x = row_rect.left() + 14.0;
                             let title = format!("{arrow} {status_text} {media_type}");
@@ -403,7 +460,11 @@ fn detail_panel(app: &mut App, ui: &mut egui::Ui, entry: &CallLogEntry) {
                                 arrow_color,
                             );
 
-                            let right_text = if dur.is_empty() { stamp } else { format!("{stamp} ({dur})") };
+                            let right_text = if dur.is_empty() {
+                                stamp
+                            } else {
+                                format!("{stamp} ({dur})")
+                            };
                             theme::paint_text(
                                 ui,
                                 pos2(row_rect.right() - 14.0, row_rect.center().y),
@@ -441,7 +502,8 @@ fn action_pill_button(
         };
 
         ui.painter().rect_filled(rect, CornerRadius::same(19), bg);
-        let icon_rect = Rect::from_center_size(pos2(rect.left() + 24.0, rect.center().y), vec2(18.0, 18.0));
+        let icon_rect =
+            Rect::from_center_size(pos2(rect.left() + 24.0, rect.center().y), vec2(18.0, 18.0));
         theme::paint_icon(ui, icon, icon_rect, 16.0, accent);
 
         theme::paint_text(
@@ -461,7 +523,8 @@ fn empty_placeholder(app: &App, ui: &mut egui::Ui) {
     let palette = app.palette;
     let rect = ui.available_rect_before_wrap();
 
-    ui.painter().rect_filled(rect, CornerRadius::ZERO, palette.panel);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, palette.panel);
 
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         ui.vertical_centered(|ui| {
@@ -471,19 +534,14 @@ fn empty_placeholder(app: &App, ui: &mut egui::Ui) {
             ui.add_space(space);
 
             let icon_circle_size = 96.0;
-            let (circle_rect, _) = ui.allocate_exact_size(vec2(icon_circle_size, icon_circle_size), Sense::hover());
+            let (circle_rect, _) =
+                ui.allocate_exact_size(vec2(icon_circle_size, icon_circle_size), Sense::hover());
             ui.painter().circle_filled(
                 circle_rect.center(),
                 icon_circle_size / 2.0,
                 palette.surface_hover,
             );
-            theme::paint_icon(
-                ui,
-                Icon::Phone,
-                circle_rect,
-                48.0,
-                palette.accent,
-            );
+            theme::paint_icon(ui, Icon::Phone, circle_rect, 48.0, palette.accent);
 
             ui.add_space(20.0);
 
@@ -498,7 +556,10 @@ fn empty_placeholder(app: &App, ui: &mut egui::Ui) {
 
             theme::text(
                 ui,
-                crate::i18n::gettext(app.locale, "Make private voice and video calls with ZapFast"),
+                crate::i18n::gettext(
+                    app.locale,
+                    "Make private voice and video calls with ZapFast",
+                ),
                 theme::regular(13.0),
                 palette.secondary,
             );

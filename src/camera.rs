@@ -154,7 +154,12 @@ impl Input {
                 vec!["-f".to_owned(), "v4l2".into(), "-i".into(), device.clone()]
             }
             Input::Screen(display) => {
-                vec!["-f".to_owned(), "x11grab".into(), "-i".into(), display.clone()]
+                vec![
+                    "-f".to_owned(),
+                    "x11grab".into(),
+                    "-i".into(),
+                    display.clone(),
+                ]
             }
             #[cfg(test)]
             Input::Synthetic(graph) => {
