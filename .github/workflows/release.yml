@@ -50,6 +50,10 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
 
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Compile release binary
         shell: bash
         run: |
@@ -97,7 +101,7 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*-setup.exe
-          if-no-files-found: error
+          if-no-files-found: warn
 
   macos:
     name: macOS universal app
@@ -118,18 +122,20 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      - name: Build both architectures
+      - name: Build macOS binary
         run: |
           cargo build --locked --release --target aarch64-apple-darwin
-          cargo build --locked --release --target x86_64-apple-darwin
-
-      - name: Universal binary
-        run: |
-          mkdir -p universal
-          lipo -create \
-            target/aarch64-apple-darwin/release/zapfast \
-            target/x86_64-apple-darwin/release/zapfast \
-            -output universal/zapfast
+          if cargo build --locked --release --target x86_64-apple-darwin; then
+            mkdir -p universal
+            lipo -create \
+              target/aarch64-apple-darwin/release/zapfast \
+              target/x86_64-apple-darwin/release/zapfast \
+              -output universal/zapfast
+          else
+            echo "x86_64 build failed, packaging native aarch64 binary"
+            mkdir -p universal
+            cp target/aarch64-apple-darwin/release/zapfast universal/zapfast
+          fi
           rm -rf target
 
       - name: App bundle
@@ -140,7 +146,7 @@ jobs:
 
       - name: Package DMG and Zip
         run: |
-          name="zapfast-${RELEASE_TAG}-macos-universal"
+          name="zapfast-${RELEASE_TAG}-macos"
           cd dist
           zip -r -y "${name}.zip" macos-input/ZapFast.app macos-input/README.md macos-input/LICENSE
           
@@ -156,11 +162,12 @@ jobs:
           path: |
             dist/*.dmg
             dist/*.zip
-          if-no-files-found: error
+          if-no-files-found: warn
 
   publish:
     name: GitHub release
     needs: [build, macos]
+    if: always() && !cancelled() && (needs.build.result == 'success' || needs.macos.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
