@@ -13,17 +13,9 @@ env:
   ZAPFAST_GIPHY_KEY: ${{ secrets.ZAPFAST_GIPHY_KEY || secrets.FASTSAPP_GIPHY_KEY }}
 
 jobs:
-  build:
-    name: build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+  linux:
+    name: build (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Resolve release version
@@ -31,80 +23,122 @@ jobs:
         run: |
           cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
           tag="${GITHUB_REF_NAME:-v$cargo_version}"
-          if [ -z "$tag" ] || [ "$tag" = "null" ]; then tag="v$cargo_version"; fi
+          if [ -z "$tag" ] || [ "$tag" = "null" ] || [ "$tag" = "main" ]; then tag="v$cargo_version-calls"; fi
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
           echo "RELEASE_VERSION=${tag#v}" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-      - run: rustup target add ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
+      - run: rustup target add x86_64-unknown-linux-gnu
 
       - name: GUI build dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev libssl-dev pkg-config cmake perl
-
-      - name: Set up NASM
-        if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
-
-      - name: Set up MSVC environment
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev libssl-dev pkg-config cmake perl nasm
 
       - name: Compile release binary
         shell: bash
         run: |
-          cargo build --locked --release --target ${{ matrix.target }}
+          cargo build --locked --release --target x86_64-unknown-linux-gnu
 
       - name: Package
         shell: bash
         run: |
-          name="zapfast-${RELEASE_TAG}-${{ matrix.target }}"
+          name="zapfast-${RELEASE_TAG}-x86_64-unknown-linux-gnu"
           mkdir -p "dist/$name"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "target/${{ matrix.target }}/release/zapfast.exe" "dist/$name/"
-          else
-            cp "target/${{ matrix.target }}/release/zapfast" "dist/$name/"
-          fi
+          cp "target/x86_64-unknown-linux-gnu/release/zapfast" "dist/$name/"
           cp README.md LICENSE THIRD-PARTY-NOTICES.md packaging/zapfast-portable.txt "dist/$name/"
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            cp --parents packaging/applications/zapfast.desktop packaging/icons/zapfast.svg contrib/omarchy/zapfast.json.tpl contrib/omarchy/zapfast-theme "dist/$name/"
-          fi
+          cp --parents packaging/applications/zapfast.desktop packaging/icons/zapfast.svg contrib/omarchy/zapfast.json.tpl contrib/omarchy/zapfast-theme "dist/$name/"
           cd dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "$name.zip" "$name"
-          else
-            tar czf "$name.tar.gz" "$name"
-          fi
-
-      - name: Windows Installer (Inno Setup)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $version = "$env:RELEASE_VERSION"
-          $arch = "${{ matrix.target }}".Split("-")[0]
-          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
-          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
-          $numericVersion = $version.Split("-")[0]
-          & $iscc "/DVersion=$version" "/DNumericVersion=$numericVersion" "/DArch=$arch" `
-            "/DBinary=$PWD\target\${{ matrix.target }}\release\zapfast.exe" `
-            "/DOutputDir=$PWD\dist" packaging\windows\zapfast.iss
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          tar czf "$name.tar.gz" "$name"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: release-linux
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: build (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve release version
+        shell: pwsh
+        run: |
+          $cargoVersion = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches.Groups[1].Value
+          $tag = if ($env:GITHUB_REF_NAME -and $env:GITHUB_REF_NAME -ne "main") { $env:GITHUB_REF_NAME } else { "v$cargoVersion-calls" }
+          $version = $tag.TrimStart("v")
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Set up NASM
+        uses: ilammy/setup-nasm@v1
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --confirm --no-progress
+
+      - name: Compile release binary
+        shell: pwsh
+        run: |
+          cargo build --locked --release --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath build-windows.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "zapfast-${env:RELEASE_TAG}-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force -Path "dist\$name"
+          Copy-Item "target\x86_64-pc-windows-msvc\release\zapfast.exe" "dist\$name\"
+          Copy-Item README.md, LICENSE, THIRD-PARTY-NOTICES.md, packaging\zapfast-portable.txt "dist\$name\"
+          7z a "dist\$name.zip" "dist\$name"
+
+      - name: Windows Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $version = "$env:RELEASE_VERSION"
+          $numericVersion = $version.Split("-")[0]
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
+          if (Test-Path $iscc) {
+            & $iscc "/DVersion=$version" "/DNumericVersion=$numericVersion" "/DArch=x86_64" `
+              "/DBinary=$PWD\target\x86_64-pc-windows-msvc\release\zapfast.exe" `
+              "/DOutputDir=$PWD\dist" packaging\windows\zapfast.iss
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Warning "ISCC.exe not found, skipping installer creation."
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
           path: |
-            dist/*.tar.gz
             dist/*.zip
             dist/*-setup.exe
           if-no-files-found: warn
 
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-windows
+          path: build-windows.log
+          if-no-files-found: ignore
+
   macos:
-    name: macOS universal app
+    name: build (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -113,7 +147,7 @@ jobs:
         run: |
           cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
           tag="${GITHUB_REF_NAME:-v$cargo_version}"
-          if [ -z "$tag" ] || [ "$tag" = "null" ]; then tag="v$cargo_version"; fi
+          if [ -z "$tag" ] || [ "$tag" = "null" ] || [ "$tag" = "main" ]; then tag="v$cargo_version-calls"; fi
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
           echo "RELEASE_VERSION=${tag#v}" >> "$GITHUB_ENV"
 
@@ -122,29 +156,38 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
+      - name: Set up NASM
+        uses: ilammy/setup-nasm@v1
+
       - name: Build macOS binary
+        shell: bash
         run: |
+          set -e
+          mkdir -p universal
+          echo "Building Apple Silicon (aarch64) release..."
           cargo build --locked --release --target aarch64-apple-darwin
+          cp target/aarch64-apple-darwin/release/zapfast universal/zapfast
+
+          echo "Attempting Intel (x86_64) release for universal binary..."
           if cargo build --locked --release --target x86_64-apple-darwin; then
-            mkdir -p universal
+            echo "Both architectures built successfully. Creating universal binary via lipo..."
             lipo -create \
               target/aarch64-apple-darwin/release/zapfast \
               target/x86_64-apple-darwin/release/zapfast \
               -output universal/zapfast
           else
-            echo "x86_64 build failed, packaging native aarch64 binary"
-            mkdir -p universal
-            cp target/aarch64-apple-darwin/release/zapfast universal/zapfast
+            echo "x86_64 build not available, proceeding with native aarch64 binary"
           fi
-          rm -rf target
 
       - name: App bundle
+        shell: bash
         run: |
           mkdir -p dist/macos-input
           bash packaging/macos/bundle.sh universal/zapfast dist/macos-input/ZapFast.app "$RELEASE_VERSION"
           cp README.md LICENSE THIRD-PARTY-NOTICES.md dist/macos-input/
 
       - name: Package DMG and Zip
+        shell: bash
         run: |
           name="zapfast-${RELEASE_TAG}-macos"
           cd dist
@@ -158,7 +201,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-universal
+          name: release-macos
           path: |
             dist/*.dmg
             dist/*.zip
@@ -166,8 +209,8 @@ jobs:
 
   publish:
     name: GitHub release
-    needs: [build, macos]
-    if: always() && !cancelled() && (needs.build.result == 'success' || needs.macos.result == 'success')
+    needs: [linux, windows, macos]
+    if: always() && !cancelled() && (needs.linux.result == 'success' || needs.windows.result == 'success' || needs.macos.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -178,13 +221,19 @@ jobs:
         run: |
           cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
           tag="${GITHUB_REF_NAME:-v$cargo_version}"
-          if [ -z "$tag" ] || [ "$tag" = "null" ]; then tag="v$cargo_version"; fi
+          if [ -z "$tag" ] || [ "$tag" = "null" ] || [ "$tag" = "main" ]; then tag="v$cargo_version-calls"; fi
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
 
       - uses: actions/download-artifact@v4
         with:
+          pattern: 'release-*'
           path: dist
           merge-multiple: true
+
+      - name: List downloaded release assets
+        shell: bash
+        run: |
+          ls -la dist/
 
       - name: Prepare Release Notes
         shell: bash
@@ -193,20 +242,9 @@ jobs:
           if [ -f "$notes" ]; then
             cp "$notes" release-notes.md
           else
-            echo "# ZapFast (Calls & Extended Edition)" > release-notes.md
-            echo "" >> release-notes.md
-            echo "Versi fork dari ZapFast dengan dukungan penuh fitur-fitur WhatsApp modern:" >> release-notes.md
-            echo "" >> release-notes.md
-            echo "### ✨ Fitur Baru & Peningkatan:" >> release-notes.md
-            echo "- 📞 Voice & Video Calls: Panggilan suara & video call native WebRTC 30 FPS" >> release-notes.md
-            echo "- 📋 Call History: Halaman log panggilan terjawab & missed call" >> release-notes.md
-            echo "- 🌟 Starred Messages: Tandai pesan penting dengan bintang" >> release-notes.md
-            echo "- 📌 Pinned Messages: Sematkan pesan di bagian atas chat" >> release-notes.md
-            echo "- 🎬 Status Video: Audio story (AAC) jernih + tombol hapus status sendiri" >> release-notes.md
-            echo "- ✨ Animated Stickers: Pemutaran stiker animasi terus-menerus" >> release-notes.md
-            echo "- 🚫 Block & Unblock: Kelola pemblokiran kontak langsung dari aplikasi" >> release-notes.md
-            echo "- ⏳ Disappearing Messages: Pengaturan durasi pesan sementara" >> release-notes.md
-            echo "- 🎨 Modern WhatsApp Web UI: Sidebar rail terintegrasi & filter unread/missed" >> release-notes.md
+            echo "Notes not found at $notes, creating fallback notes"
+            echo "# ZapFast Extended \${RELEASE_TAG}" > release-notes.md
+            echo "Dukungan penuh Voice & Video Calls WebRTC dan fitur WhatsApp modern." >> release-notes.md
           fi
 
       - name: Create GitHub Release
