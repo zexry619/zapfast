@@ -85,12 +85,8 @@ jobs:
           cache-generation: test-v1
       # The demo feature carries the headless layout test of every screen.
       - name: Tests (default features)
-        env:
-          OPENSSL_NO_VENDOR: 1
         run: mbx test --locked --all-targets
       - name: Tests (all features)
-        env:
-          OPENSSL_NO_VENDOR: 1
         run: mbx test --locked --all-targets --all-features
       - name: Build macOS demo
         if: runner.os == 'macOS'

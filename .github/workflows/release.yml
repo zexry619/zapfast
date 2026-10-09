@@ -50,8 +50,6 @@ jobs:
 
       - name: Compile release binary
         shell: bash
-        env:
-          OPENSSL_NO_VENDOR: 1
         run: |
           cargo build --locked --release --target ${{ matrix.target }}
 
