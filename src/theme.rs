@@ -677,6 +677,7 @@ fastframe_icons::icons! {
         SquarePen => lucide "square-pen",
         Star => "star",
         StarOff => "star-off",
+        Status => "status",
         Sticker => "sticker",
         Sun => lucide "sun",
         Tag => "tag",
@@ -1026,6 +1027,18 @@ pub fn text(
             .truncate()
             .selectable(false),
     )
+}
+
+/// Paints text directly onto the painter at `pos` with `align`.
+pub fn paint_text(
+    ui: &egui::Ui,
+    pos: egui::Pos2,
+    align: egui::Align2,
+    text: impl ToString,
+    font: egui::FontId,
+    color: Color32,
+) {
+    ui.painter().text(pos, align, text, font, color);
 }
 
 /// Selectable text label.

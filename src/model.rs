@@ -988,9 +988,11 @@ impl Contact {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Chats,
+    Stories,
+    Calls,
     Settings,
     Wallpaper,
 }
@@ -1431,6 +1433,12 @@ pub enum Action {
         text: String,
         raw_message: Option<Vec<u8>>,
     },
+    /// Selects a contact's story in the stories page.
+    SelectStoryContact(String),
+    /// Selects a call log entry in the calls page.
+    SelectCallLog(String),
+    /// Toggles the missed-only calls filter.
+    ToggleCallsFilterMissed,
     /// Creates and opens a chat for a contact without one.
     StartChat {
         id: ChatId,

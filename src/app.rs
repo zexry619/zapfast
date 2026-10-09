@@ -609,6 +609,12 @@ pub struct App {
     pub blocked_contacts: std::collections::HashSet<String>,
     /// Recent call log entries.
     pub call_logs: Vec<crate::model::CallLogEntry>,
+    /// Active contact selected in the Stories page sidebar.
+    pub active_story_contact: Option<String>,
+    /// Active call log selected in the Calls page sidebar.
+    pub active_call_log: Option<String>,
+    /// Whether only missed calls are shown in the Calls page.
+    pub calls_filter_missed: bool,
     /// Starred messages for dialog.
     pub starred_messages: Vec<Message>,
     /// Filter for starred messages dialog (None = all chats).
@@ -1192,6 +1198,9 @@ impl App {
             post_story_media_path: None,
             blocked_contacts: std::collections::HashSet::new(),
             call_logs: Vec::new(),
+            active_story_contact: None,
+            active_call_log: None,
+            calls_filter_missed: false,
             starred_messages: Vec::new(),
             starred_filter_chat: None,
             call_surface_hidden: false,
@@ -4576,6 +4585,9 @@ impl App {
                     self.settings_search.clear();
                     self.refocus_composer(ctx);
                 }
+                if page == Page::Calls {
+                    self.backend.send(Command::FetchCallLogs);
+                }
             }
             Action::ToggleSettings => {
                 // The button that opened settings closes them again, and
@@ -6432,6 +6444,21 @@ impl App {
             Action::FetchStarredMessages(chat) => {
                 self.starred_filter_chat = chat.clone();
                 self.backend.send(Command::FetchStarredMessages { chat });
+            }
+            Action::SelectStoryContact(jid) => {
+                self.active_story_contact = Some(jid.clone());
+                if let Some(items) = self.stories.stories_by_sender.get(&jid) {
+                    if !items.is_empty() {
+                        let idx = items.iter().position(|it| !it.viewed).unwrap_or(0);
+                        self.apply(Action::OpenStoryViewer { sender: jid, index: idx }, ctx);
+                    }
+                }
+            }
+            Action::SelectCallLog(id) => {
+                self.active_call_log = Some(id);
+            }
+            Action::ToggleCallsFilterMissed => {
+                self.calls_filter_missed = !self.calls_filter_missed;
             }
         }
     }
@@ -13389,5 +13416,51 @@ mod app_lock_tests {
         assert!(!actions.contains(&Action::FocusComposer));
         let mut app = app_with(settings(None));
         assert!(!press(&mut app).contains(&Action::LockApp));
+    }
+
+    #[test]
+    fn whatsapp_web_navigation_and_actions() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, _events) = App::headless(AppDirs::under(root.path()), Settings::default());
+        let ctx = egui::Context::default();
+
+        // 1. Navigation to Stories
+        app.apply(Action::Open(Page::Stories), &ctx);
+        assert_eq!(app.page, Page::Stories);
+
+        // 2. Story selection
+        let test_sender = "628123456789@s.whatsapp.net".to_string();
+        app.stories.add(crate::stories::StoryItem {
+            id: "story-123".to_string(),
+            sender: test_sender.clone(),
+            sender_name: Some("Budi".to_string()),
+            timestamp: 1700000000,
+            text: Some("Halo status".to_string()),
+            background_argb: None,
+            font: None,
+            media_type: None,
+            caption: None,
+            thumbnail: None,
+            media_path: None,
+            raw_message: None,
+            viewed: false,
+        });
+        app.apply(Action::SelectStoryContact(test_sender.clone()), &ctx);
+        assert_eq!(app.active_story_contact.as_deref(), Some(test_sender.as_str()));
+        assert!(app.story_viewer.is_some());
+
+        // 3. Navigation to Calls
+        app.apply(Action::Open(Page::Calls), &ctx);
+        assert_eq!(app.page, Page::Calls);
+
+        // 4. Calls actions
+        assert!(!app.calls_filter_missed);
+        app.apply(Action::ToggleCallsFilterMissed, &ctx);
+        assert!(app.calls_filter_missed);
+        app.apply(Action::ToggleCallsFilterMissed, &ctx);
+        assert!(!app.calls_filter_missed);
+
+        app.apply(Action::SelectCallLog("call-456".to_string()), &ctx);
+        assert_eq!(app.active_call_log.as_deref(), Some("call-456"));
     }
 }

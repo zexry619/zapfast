@@ -169,6 +169,10 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             actions.push(Action::SearchSettings(String::new()));
         } else if app.page == Page::Settings {
             actions.push(Action::Open(Page::Chats));
+        } else if app.page == Page::Stories {
+            actions.push(Action::Open(Page::Chats));
+        } else if app.page == Page::Calls {
+            actions.push(Action::Open(Page::Chats));
         } else if search_focused || !app.search.is_empty() {
             if !app.search.is_empty() {
                 actions.push(Action::Search(String::new()));
@@ -660,8 +664,14 @@ mod tests {
         escape(&mut app, &ctx);
         assert!(matches!(app.actions.as_slice(), [Action::CloseChatSearch]));
         app.actions.clear();
-        // Settings hide the pane, so Escape leaves them instead.
-        app.page = Page::Settings;
+        app.page = Page::Stories;
+        escape(&mut app, &ctx);
+        assert!(matches!(
+            app.actions.as_slice(),
+            [Action::Open(Page::Chats)]
+        ));
+        app.actions.clear();
+        app.page = Page::Calls;
         escape(&mut app, &ctx);
         assert!(matches!(
             app.actions.as_slice(),

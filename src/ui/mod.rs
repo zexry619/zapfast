@@ -17,6 +17,9 @@ pub mod picker;
 pub mod polls;
 pub mod settings;
 pub mod stories;
+pub mod calls_page;
+pub mod rail;
+pub mod stories_page;
 pub mod update;
 pub mod video_preview;
 pub mod widgets;
@@ -94,7 +97,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     image_preview::show(app, ctx);
     video_preview::show(app, ctx);
     call::show(app, ctx);
-    stories::viewer_show(app, ctx);
+    if app.page != Page::Stories {
+        stories::viewer_show(app, ctx);
+    }
     stories::post_modal_show(app, ctx);
     drop_target(app, ctx);
     toasts(app, ctx);
@@ -111,9 +116,18 @@ fn main_view(app: &mut App, ui: &mut egui::Ui, list_only: bool) {
     // A narrow window gives the open chat or page all of its width; the
     // conversation header's Back returns to the list.
     if !narrow(ui.ctx()) {
-        match app.sidebar_mode() {
-            SidebarDisplayMode::Expanded => chats::show(app, ui),
-            SidebarDisplayMode::CollapsedIconsOnly => chats::compact_show(app, ui),
+        rail::show(app, ui);
+        match app.page {
+            Page::Chats => match app.sidebar_mode() {
+                SidebarDisplayMode::Expanded => chats::show(app, ui),
+                SidebarDisplayMode::CollapsedIconsOnly => chats::compact_show(app, ui),
+            },
+            Page::Stories => stories_page::sidebar(app, ui),
+            Page::Calls => calls_page::sidebar(app, ui),
+            Page::Settings | Page::Wallpaper => match app.sidebar_mode() {
+                SidebarDisplayMode::Expanded => chats::show(app, ui),
+                SidebarDisplayMode::CollapsedIconsOnly => chats::compact_show(app, ui),
+            },
         }
     }
     let search_overlay = pane::show(app, ui);
@@ -122,6 +136,8 @@ fn main_view(app: &mut App, ui: &mut egui::Ui, list_only: bool) {
         .show(ui, |ui| match app.page {
             Page::Settings => settings::show(app, ui),
             Page::Chats => conversation::show(app, ui),
+            Page::Stories => stories_page::show(app, ui),
+            Page::Calls => calls_page::show(app, ui),
             Page::Wallpaper => settings::wallpaper_show(app, ui),
         });
     if let Some(region) = search_overlay {

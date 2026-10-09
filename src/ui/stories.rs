@@ -69,7 +69,7 @@ impl StoryViewerState {
 }
 
 /// Formats a unix timestamp in seconds to a human-readable relative time.
-fn format_relative_time(timestamp: u64) -> String {
+pub(crate) fn format_relative_time(timestamp: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -374,6 +374,11 @@ fn render_thumbnail(
 
 /// Full-screen overlay modal for viewing a story with timer progress.
 pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
+    viewer_show_in(app, ctx, None);
+}
+
+/// Views a story with timer progress, optionally constrained to a custom bounds area.
+pub fn viewer_show_in(app: &mut App, ctx: &egui::Context, bounds: Option<Rect>) {
     let Some(state) = app.story_viewer.clone() else {
         return;
     };
@@ -500,7 +505,7 @@ pub fn viewer_show(app: &mut App, ctx: &egui::Context) {
     let is_image_loading = is_image && current_item.media_path.is_none() && current_item.raw_message.is_some();
     let is_media_loading = is_video_loading || is_image_loading;
 
-    let screen = ctx.content_rect();
+    let screen = bounds.unwrap_or_else(|| ctx.content_rect());
     let palette = app.palette;
 
     let screen_w = screen.width();
