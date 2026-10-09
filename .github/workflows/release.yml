@@ -93,7 +93,11 @@ jobs:
         shell: pwsh
         run: |
           cargo build --locked --release --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath build-windows.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::Windows cargo build failed with exit code $LASTEXITCODE. Showing last 150 lines of log:"
+            Get-Content build-windows.log -Tail 150
+            exit $LASTEXITCODE
+          }
 
       - name: Package
         shell: pwsh
@@ -162,14 +166,18 @@ jobs:
       - name: Build macOS binary
         shell: bash
         run: |
-          set -e
+          set -o pipefail
           mkdir -p universal
           echo "Building Apple Silicon (aarch64) release..."
-          cargo build --locked --release --target aarch64-apple-darwin
+          if ! cargo build --locked --release --target aarch64-apple-darwin 2>&1 | tee build-macos.log; then
+            echo "::error::macOS aarch64 cargo build failed! Showing last 150 lines of log:"
+            tail -n 150 build-macos.log
+            exit 1
+          fi
           cp target/aarch64-apple-darwin/release/zapfast universal/zapfast
 
           echo "Attempting Intel (x86_64) release for universal binary..."
-          if cargo build --locked --release --target x86_64-apple-darwin; then
+          if cargo build --locked --release --target x86_64-apple-darwin 2>&1 | tee build-macos-intel.log; then
             echo "Both architectures built successfully. Creating universal binary via lipo..."
             lipo -create \
               target/aarch64-apple-darwin/release/zapfast \
@@ -206,6 +214,14 @@ jobs:
             dist/*.dmg
             dist/*.zip
           if-no-files-found: warn
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-macos
+          path: build-macos*.log
+          if-no-files-found: ignore
 
   publish:
     name: GitHub release
@@ -247,7 +263,7 @@ jobs:
             echo "Dukungan penuh Voice & Video Calls WebRTC dan fitur WhatsApp modern." >> release-notes.md
           fi
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
@@ -256,3 +272,11 @@ jobs:
           generate_release_notes: false
           draft: false
           prerelease: false
+          make_latest: true
+
+      - name: Ensure all assets are uploaded
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${RELEASE_TAG}" dist/* --clobber || true
