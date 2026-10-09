@@ -6120,14 +6120,16 @@ fn picture(
         None => (width.min(PICTURE_WIDTH), PICTURE_HEIGHT),
     };
     if let Some(path) = &media.path {
-        if sticker == Some(true) {
+        let is_moving_sticker = sticker.is_some()
+            && (sticker == Some(true) || crate::ui::picker::moves(ui.ctx(), path));
+        if is_moving_sticker {
             let size = fit_sticker(
                 media.width.unwrap_or(180) as f32,
                 media.height.unwrap_or(180) as f32,
             );
             let (rect, response) = ui.allocate_exact_size(size, Sense::click());
             if ui.is_rect_visible(rect) {
-                match animation::frame(ui, path, rect, view.animate && response.hovered()) {
+                match animation::frame(ui, path, rect, view.animate) {
                     animation::Frame::Ready(texture) => {
                         ui.painter().image(
                             texture.id(),
@@ -6137,8 +6139,9 @@ fn picture(
                         );
                     }
                     _ => {
-                        ui.painter().rect_filled(rect, 6.0, palette.surface);
-                        theme::paint_icon(ui, Icon::Sticker, rect, 32.0, palette.secondary);
+                        widgets::file_image(ui, path)
+                            .fit_to_exact_size(rect.size())
+                            .paint_at(ui, rect);
                     }
                 }
             }

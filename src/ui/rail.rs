@@ -1,13 +1,14 @@
-//! Left Navigation Rail: WhatsApp Web 3-zone persistent icon column (width ~54px).
+//! Left Navigation Rail: WhatsApp Web persistent icon column (width 64px).
 
 use egui::{CornerRadius, Frame, Margin, Rect, Sense, pos2, vec2};
 
 use crate::app::App;
 use crate::model::{Action, CallLogStatus, Page};
 use crate::theme::{self, Icon, Palette};
+use super::focus::{Stop, TabStop};
 use super::widgets;
 
-pub const RAIL_WIDTH: f32 = 54.0;
+pub const RAIL_WIDTH: f32 = 64.0;
 
 enum BadgeKind {
     Dot(egui::Color32),
@@ -20,7 +21,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .resizable(false)
         .exact_size(RAIL_WIDTH)
         .show_separator_line(false)
-        .frame(Frame::new().fill(palette.panel).inner_margin(Margin::symmetric(4, 6)));
+        .frame(Frame::new().fill(palette.window).inner_margin(Margin::symmetric(0, 8)));
 
     let response = panel.show(ui, |ui| {
         let inset = theme::traffic_light_inset(ui.ctx());
@@ -31,7 +32,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(4.0);
         }
 
-        let bottom_height = 92.0;
+        let bottom_height = 144.0;
 
         // Top Navigation Icons
         ui.vertical_centered(|ui| {
@@ -50,11 +51,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 is_chats,
                 chats_badge,
                 &crate::i18n::gettext(app.locale, "Chats"),
-            ) {
+            )
+            .clicked()
+            {
                 app.actions.push(Action::Open(Page::Chats));
             }
 
-            ui.add_space(6.0);
+            ui.add_space(8.0);
 
             // 2. Stories / Status
             let is_stories = app.page == Page::Stories;
@@ -74,21 +77,29 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 is_stories,
                 status_badge,
                 &crate::i18n::gettext(app.locale, "Status"),
-            ) {
+            )
+            .clicked()
+            {
                 app.actions.push(Action::Open(Page::Stories));
             }
 
-            ui.add_space(6.0);
+            ui.add_space(8.0);
 
             // 3. Calls
             let is_calls = app.page == Page::Calls;
-            let missed_calls = app
-                .call_logs
-                .iter()
-                .filter(|c| c.status == CallLogStatus::Missed)
-                .count();
-            let calls_badge = if missed_calls > 0 {
-                Some(BadgeKind::Count(missed_calls))
+            let unseen_missed = if is_calls {
+                0
+            } else {
+                app.call_logs
+                    .iter()
+                    .filter(|c| {
+                        c.status == CallLogStatus::Missed
+                            && c.timestamp > app.settings.last_seen_call_timestamp
+                    })
+                    .count()
+            };
+            let calls_badge = if unseen_missed > 0 {
+                Some(BadgeKind::Count(unseen_missed))
             } else {
                 None
             };
@@ -99,17 +110,36 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 is_calls,
                 calls_badge,
                 &crate::i18n::gettext(app.locale, "Calls"),
-            ) {
+            )
+            .clicked()
+            {
                 app.actions.push(Action::Open(Page::Calls));
             }
         });
 
-        // Spacer pushing Settings & Profile avatar to bottom
+        // Spacer pushing Starred, Settings & Profile avatar to bottom
         let space_to_bottom = (ui.available_height() - bottom_height).max(0.0);
         ui.add_space(space_to_bottom);
 
         // Bottom Navigation Icons
         ui.vertical_centered(|ui| {
+            // Starred messages
+            let is_starred_open = matches!(app.dialog, Some(crate::model::Dialog::StarredMessages { .. }));
+            if nav_button(
+                ui,
+                &palette,
+                Icon::Star,
+                is_starred_open,
+                None,
+                &crate::i18n::gettext(app.locale, "Starred messages"),
+            )
+            .clicked()
+            {
+                app.actions.push(Action::ShowDialog(crate::model::Dialog::StarredMessages { chat: None }));
+            }
+
+            ui.add_space(8.0);
+
             // Settings
             let is_settings = app.page == Page::Settings;
             if nav_button(
@@ -119,14 +149,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 is_settings,
                 None,
                 &crate::i18n::gettext(app.locale, "Settings"),
-            ) {
+            )
+            .tab_stop(Stop::Settings)
+            .clicked()
+            {
                 app.actions.push(Action::ToggleSettings);
             }
 
             ui.add_space(10.0);
 
             // Profile Avatar
-            super::accounts::avatar_button(app, ui, 34.0);
+            super::accounts::avatar_button(app, ui, 36.0).tab_stop(Stop::Profile);
             ui.add_space(6.0);
         });
     });
@@ -141,8 +174,8 @@ fn nav_button(
     is_active: bool,
     badge: Option<BadgeKind>,
     tooltip: &str,
-) -> bool {
-    let size = vec2(42.0, 42.0);
+) -> egui::Response {
+    let size = vec2(44.0, 44.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let hovered = response.hovered();
 
@@ -151,19 +184,13 @@ fn nav_button(
         if is_active {
             ui.painter().rect_filled(
                 rect,
-                CornerRadius::same(10),
-                palette.surface_hover,
+                CornerRadius::same(12),
+                palette.surface_active,
             );
-            // Left active indicator pill
-            let indicator_rect = Rect::from_min_size(
-                pos2(rect.left() - 3.0, rect.top() + 8.0),
-                vec2(3.0, rect.height() - 16.0),
-            );
-            ui.painter().rect_filled(indicator_rect, CornerRadius::same(2), palette.accent);
         } else if hovered {
             ui.painter().rect_filled(
                 rect,
-                CornerRadius::same(10),
+                CornerRadius::same(12),
                 palette.surface_hover,
             );
         }
@@ -177,7 +204,7 @@ fn nav_button(
             palette.secondary
         };
 
-        let icon_size = 20.0;
+        let icon_size = 22.0;
         let scale = if response.is_pointer_button_down_on() { 0.92 } else { 1.0 };
         theme::paint_icon(ui, icon, rect, icon_size * scale, icon_color);
 
@@ -185,22 +212,45 @@ fn nav_button(
         match badge {
             Some(BadgeKind::Dot(color)) => {
                 let dot_pos = pos2(rect.right() - 8.0, rect.top() + 8.0);
-                ui.painter().circle_filled(dot_pos, 4.0, color);
+                ui.painter().circle_filled(dot_pos, 5.0, palette.window);
+                ui.painter().circle_filled(dot_pos, 3.5, color);
             }
             Some(BadgeKind::Count(count)) if count > 0 => {
-                let badge_pos = pos2(rect.right() - 6.0, rect.top() + 6.0);
-                widgets::badge(ui, palette, badge_pos, count as u32, false);
+                let label = if count > 99 {
+                    "99+".to_string()
+                } else {
+                    count.to_string()
+                };
+                let galley = ui.painter().layout_no_wrap(label, theme::bold(10.0), palette.on_accent);
+                let badge_h = 16.0;
+                let badge_w = (galley.size().x + 8.0).max(badge_h);
+                let badge_center = pos2(rect.right() - 6.0, rect.top() + 8.0);
+                let badge_rect = Rect::from_center_size(badge_center, vec2(badge_w, badge_h));
+
+                ui.painter().rect_filled(
+                    badge_rect.expand(1.5),
+                    CornerRadius::same(10),
+                    palette.window,
+                );
+                ui.painter().rect_filled(
+                    badge_rect,
+                    CornerRadius::same(8),
+                    palette.accent,
+                );
+                ui.painter().galley(
+                    badge_rect.center() - galley.size() / 2.0,
+                    galley,
+                    palette.on_accent,
+                );
             }
             _ => {}
         }
     }
 
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let response = if !tooltip.is_empty() {
+    if !tooltip.is_empty() {
         response.on_hover_text(tooltip)
     } else {
         response
-    };
-
-    response.clicked()
+    }
 }

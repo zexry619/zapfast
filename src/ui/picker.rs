@@ -1712,12 +1712,7 @@ fn paint_tile(
             _ => false,
         };
     if !played {
-        if animated {
-            ui.painter().rect_filled(shown, 6.0, palette.surface);
-            theme::paint_icon(ui, Icon::Sticker, shown, 24.0, palette.secondary);
-        } else {
-            sticker_picture(ui, path, shown);
-        }
+        sticker_picture(ui, path, shown);
     }
 }
 
@@ -1843,7 +1838,7 @@ fn pack_holds(pack: &StickerPack, hash: &str) -> bool {
 
 /// Returns whether a sticker moves, probing each path once and re-probing
 /// only when the file changes on disk.
-fn moves(ctx: &egui::Context, path: &Path) -> bool {
+pub(crate) fn moves(ctx: &egui::Context, path: &Path) -> bool {
     ctx.data_mut(|data| {
         data.get_temp_mut_or_default::<MotionMemo>(egui::Id::new("animated-sticker-paths"))
             .moves(path, probe_motion)

@@ -42,10 +42,9 @@ const PREVIEW_LONG_SIDE: usize = 320;
 const PREVIEW_SHORT_SIDE: usize = 180;
 /// The cadence the camera is asked for and the encoder is built for.
 ///
-/// Fifteen frames a second matches WhatsApp VoIP reference cadence (VIDEO_TS_STRIDE_15FPS = 6000).
-/// A stable 15 FPS cadence cuts outbound UDP packet flooding in half and prevents buffer bloat on TURN/mobile peers.
-const VIDEO_FPS: u32 = 15;
-/// RTP video clock (90 kHz) divided by the capture cadence (6000 at 15 fps).
+/// Thirty frames a second provides smooth motion cadence (VIDEO_TS_STRIDE = 3000 at 30 fps).
+const VIDEO_FPS: u32 = 30;
+/// RTP video clock (90 kHz) divided by the capture cadence (3000 at 30 fps).
 const VIDEO_TS_STRIDE: u32 = 90_000 / VIDEO_FPS;
 
 // ---------------------------------------------------------------------------
@@ -1114,8 +1113,8 @@ fn capture_frames(
     let mut drops_in_sec: u32 = 0;
     let mut au_bytes_acc: u64 = 0;
 
-    // Minimum interval between encoded outbound frames to maintain steady 15 FPS cadence on the wire:
-    let min_frame_interval = Duration::from_millis(1000 / VIDEO_FPS as u64 - 5);
+    // Minimum interval between encoded outbound frames to maintain steady cadence without dropping valid camera frames:
+    let min_frame_interval = Duration::from_millis((1000 / VIDEO_FPS as u64) * 6 / 10);
     let mut last_send_time = Instant::now() - min_frame_interval;
 
     // Cache latest SPS and PPS NALs to guarantee every IDR keyframe has repeated headers:
@@ -1148,7 +1147,8 @@ fn capture_frames(
         }
         let read_dur = t_read_start.elapsed();
         read_us_acc += read_dur.as_micros() as u64;
-        if read_dur.as_millis() > 60 {
+        let max_expected_read_ms = (1000 / VIDEO_FPS as u128) + 50;
+        if read_dur.as_millis() > max_expected_read_ms {
             log::warn!("[CALL][CAM] slow camera read: took {}ms", read_dur.as_millis());
         }
 
@@ -1374,6 +1374,7 @@ fn decode_remote(
             let mut consecutive_errors: u32 = 0;
             let mut last_orientation = 0u8;
             let mut last_keyframe_request = Instant::now() - Duration::from_secs(1);
+            let mut last_delivery = Instant::now();
 
             let mut sec_timer = Instant::now();
             let mut frames_in_sec: u32 = 0;
@@ -1446,6 +1447,19 @@ fn decode_remote(
                             conv_us_acc += t_conv_start.elapsed().as_micros() as u64;
 
                             let image = Arc::new(image);
+
+                            // Playout pacing: prevent jitter bursts from delivering multiple frames in sub-millisecond
+                            // intervals where the UI loop would overwrite and skip intermediate frames.
+                            let now = Instant::now();
+                            let elapsed = now.duration_since(last_delivery);
+                            let queue_len = frames.len();
+                            if queue_len <= 3 && elapsed < Duration::from_millis(35) {
+                                std::thread::sleep(Duration::from_millis(35) - elapsed);
+                            } else if queue_len <= 6 && elapsed < Duration::from_millis(18) {
+                                std::thread::sleep(Duration::from_millis(18) - elapsed);
+                            }
+                            last_delivery = Instant::now();
+
                             if ticks.try_send(VideoTick::Remote(image)).is_err() {
                                 ticks_dropped += 1;
                             }

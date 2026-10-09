@@ -142,17 +142,7 @@ fn filter_chips(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
                     }
                 }
 
-                let missed_count = app
-                    .call_logs
-                    .iter()
-                    .filter(|c| c.status == CallLogStatus::Missed)
-                    .count();
-                let missed_label = if missed_count > 0 {
-                    format!("{} ({})", crate::i18n::gettext(app.locale, "Missed"), missed_count)
-                } else {
-                    crate::i18n::gettext(app.locale, "Missed").to_string()
-                };
-
+                let missed_label = crate::i18n::gettext(app.locale, "Missed");
                 if chip_button(ui, palette, &missed_label, app.calls_filter_missed) {
                     if !app.calls_filter_missed {
                         app.actions.push(Action::ToggleCallsFilterMissed);

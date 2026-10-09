@@ -4,7 +4,7 @@ use egui::{Align, Frame, Key, Layout, Margin, Rect, Sense, Vec2, pos2, vec2};
 
 use crate::app::App;
 use crate::backend::LinkStatus;
-use crate::model::{Action, Chat, ChatFilter, Contact, Dialog, Message, Page};
+use crate::model::{Action, Chat, ChatFilter, Contact, Dialog, Message};
 use crate::theme::{self, Icon, Palette};
 
 use super::focus::{Stop, TabStop};
@@ -159,10 +159,10 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                             palette.text,
                         );
                     } else {
-                        // Our avatar opens the account switcher, with the
-                        // profile and settings below the accounts.
-                        super::accounts::avatar_button(app, ui, 34.0).tab_stop(Stop::Profile);
-                        ui.add_space(2.0);
+                        if super::narrow(ui.ctx()) {
+                            super::accounts::avatar_button(app, ui, 34.0).tab_stop(Stop::Profile);
+                            ui.add_space(2.0);
+                        }
                         theme::text(
                             ui,
                             crate::i18n::gettext(app.locale, "Chats"),
@@ -171,53 +171,6 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                         );
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if theme::icon_button(
-                            ui,
-                            Icon::Settings,
-                            18.0,
-                            if app.page == Page::Settings {
-                                palette.accent
-                            } else {
-                                palette.secondary
-                            },
-                            palette.text,
-                            // Same as the avatar: the label says what the click
-                            // does now, not what it opened.
-                            if app.page == Page::Settings {
-                                "Close settings (Ctrl+,)"
-                            } else {
-                                "Settings (Ctrl+,)"
-                            },
-                        )
-                        .tab_stop(Stop::Settings)
-                        .clicked()
-                        {
-                            app.actions.push(Action::ToggleSettings);
-                        }
-                        if theme::icon_button(
-                            ui,
-                            Icon::Phone,
-                            18.0,
-                            palette.secondary,
-                            palette.text,
-                            "Calls",
-                        )
-                        .clicked()
-                        {
-                            app.actions.push(Action::ShowDialog(crate::model::Dialog::CallHistory));
-                        }
-                        if theme::icon_button(
-                            ui,
-                            Icon::Star,
-                            18.0,
-                            palette.secondary,
-                            palette.text,
-                            "Starred messages",
-                        )
-                        .clicked()
-                        {
-                            app.actions.push(Action::ShowDialog(crate::model::Dialog::StarredMessages { chat: None }));
-                        }
                         if theme::icon_button(
                             ui,
                             Icon::SquarePen,
@@ -322,10 +275,10 @@ fn macos_header(app: &mut App, ui: &mut egui::Ui) {
                         palette.text,
                     );
                 } else {
-                    // Our avatar opens the account switcher here as on the
-                    // other platforms, after the traffic lights' inset.
-                    super::accounts::avatar_button(app, ui, 30.0).tab_stop(Stop::Profile);
-                    ui.add_space(2.0);
+                    if super::narrow(ui.ctx()) {
+                        super::accounts::avatar_button(app, ui, 30.0).tab_stop(Stop::Profile);
+                        ui.add_space(2.0);
+                    }
                     theme::text(
                         ui,
                         crate::i18n::gettext(app.locale, "Chats"),
@@ -1728,6 +1681,7 @@ fn sound_menu(app: &mut App, ui: &mut egui::Ui, palette: &Palette, chat: &Chat) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Page;
     use crate::paths::AppDirs;
     use crate::settings::Settings;
 

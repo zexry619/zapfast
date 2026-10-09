@@ -154,6 +154,7 @@ fastframe-scroll = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" 
 fastframe-update = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1", features = ["reqwest"] }
 
 [patch.crates-io]
+symphonia-format-isomp4 = { path = "patches/symphonia-format-isomp4" }
 # crmne/egui apps-0.36, shared with Spotifast, RekordFlash and TonePush: egui
 # 0.36.1 with right-to-left shaping and glyph clusters from crmne/zapfast#144
 # and digits shaped left to right in text without right-to-left letters (#184)

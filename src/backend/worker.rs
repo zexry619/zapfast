@@ -9229,6 +9229,13 @@ fn context_of(base: &wa::Message) -> Option<&wa::ContextInfo> {
     if let Some(sticker) = base.sticker_message.as_option() {
         return sticker.context_info.as_option();
     }
+    if let Some(lottie) = base.lottie_sticker_message.as_option() {
+        if let Some(inner) = lottie.message.as_option() {
+            if let Some(context) = context_of(inner) {
+                return Some(context);
+            }
+        }
+    }
     if let Some(location) = base.location_message.as_option() {
         return location.context_info.as_option();
     }
@@ -9595,7 +9602,12 @@ fn classify_base(base: &wa::Message) -> Option<Content> {
     if base.call_log_messsage.is_set() || base.scheduled_call_creation_message.is_set() {
         return unsupported("call");
     }
-    if base.lottie_sticker_message.is_set() {
+    if let Some(lottie) = base.lottie_sticker_message.as_option() {
+        if let Some(inner) = lottie.message.as_option() {
+            if let Some(content) = classify(inner) {
+                return Some(content);
+            }
+        }
         return unsupported("animated sticker");
     }
     if base.poll_update_message.is_set()

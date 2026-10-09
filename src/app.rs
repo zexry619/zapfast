@@ -3229,6 +3229,18 @@ impl App {
             }
             Event::CallLogs(logs) => {
                 self.call_logs = logs;
+                if self.page == Page::Calls {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let max_ts = self.call_logs.iter().map(|c| c.timestamp).max().unwrap_or(0);
+                    let mark_ts = max_ts.max(now);
+                    if mark_ts > self.settings.last_seen_call_timestamp {
+                        self.settings.last_seen_call_timestamp = mark_ts;
+                        self.actions.push(Action::SettingsChanged);
+                    }
+                }
             }
             Event::ChatEphemeralUpdated { chat, duration_secs } => {
                 if let Some(c) = self.chats.iter_mut().find(|c| c.id == chat) {
@@ -4587,6 +4599,16 @@ impl App {
                 }
                 if page == Page::Calls {
                     self.backend.send(Command::FetchCallLogs);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let max_ts = self.call_logs.iter().map(|c| c.timestamp).max().unwrap_or(0);
+                    let mark_ts = max_ts.max(now);
+                    if mark_ts > self.settings.last_seen_call_timestamp {
+                        self.settings.last_seen_call_timestamp = mark_ts;
+                        self.actions.push(Action::SettingsChanged);
+                    }
                 }
             }
             Action::ToggleSettings => {
@@ -13449,9 +13471,38 @@ mod app_lock_tests {
         assert_eq!(app.active_story_contact.as_deref(), Some(test_sender.as_str()));
         assert!(app.story_viewer.is_some());
 
-        // 3. Navigation to Calls
+        // 3. Navigation to Calls and clearing unread missed calls count
+        app.page = Page::Chats;
+        app.settings.last_seen_call_timestamp = 0;
+        app.call_logs = vec![crate::model::CallLogEntry {
+            call_id: "call-456".to_string(),
+            peer: "628999999@s.whatsapp.net".to_string(),
+            peer_name: Some("Test Caller".to_string()),
+            from_me: false,
+            timestamp: 1700000100,
+            duration: 0,
+            is_video: true,
+            status: crate::model::CallLogStatus::Missed,
+        }];
+        let unseen_before = app
+            .call_logs
+            .iter()
+            .filter(|c| c.status == crate::model::CallLogStatus::Missed && c.timestamp > app.settings.last_seen_call_timestamp)
+            .count();
+        assert_eq!(unseen_before, 1, "missed call should initially be counted as unread");
+
         app.apply(Action::Open(Page::Calls), &ctx);
         assert_eq!(app.page, Page::Calls);
+        assert!(
+            app.settings.last_seen_call_timestamp >= 1700000100,
+            "opening Calls tab must update last_seen_call_timestamp"
+        );
+        let unseen_after = app
+            .call_logs
+            .iter()
+            .filter(|c| c.status == crate::model::CallLogStatus::Missed && c.timestamp > app.settings.last_seen_call_timestamp)
+            .count();
+        assert_eq!(unseen_after, 0, "missed call count should be 0 after opening Calls");
 
         // 4. Calls actions
         assert!(!app.calls_filter_missed);

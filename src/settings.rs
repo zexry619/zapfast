@@ -496,6 +496,10 @@ pub struct Settings {
     pub window_y: Option<f32>,
     /// Whether the window was maximized when it last closed.
     pub window_maximized: bool,
+    /// Timestamp of the latest call log when the user last viewed the Calls tab.
+    /// Missed calls occurring after this timestamp show a badge count on the navigation rail.
+    #[serde(default)]
+    pub last_seen_call_timestamp: i64,
 }
 
 impl Default for Settings {
@@ -552,6 +556,7 @@ impl Default for Settings {
             window_x: None,
             window_y: None,
             window_maximized: false,
+            last_seen_call_timestamp: 0,
         }
     }
 }
