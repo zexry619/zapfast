@@ -186,22 +186,20 @@ jobs:
           if [ -f "$notes" ]; then
             cp "$notes" release-notes.md
           else
-            cat << 'EOF' > release-notes.md
-# ZapFast (Calls & Extended Edition)
-
-Versi fork dari ZapFast dengan dukungan penuh fitur-fitur WhatsApp modern:
-
-### ✨ Fitur Baru & Peningkatan:
-- 📞 **Voice & Video Calls**: Panggilan suara & video call native WebRTC dengan 30 FPS hardware camera acceleration.
-- 📋 **Call History / Riwayat Panggilan**: Halaman log panggilan terjawab & missed call, indikator unread badge otomatis hilang saat dibuka.
-- 🌟 **Starred Messages**: Tandai pesan penting dengan bintang, sinkronisasi mutasi app-state, filter pesan berbintang.
-- 📌 **Pinned Messages**: Sematkan pesan di bagian atas ruang chat (24 jam, 7 hari, 30 hari).
-- 🎬 **WhatsApp Stories / Status Video**: Audio story (AAC) jernih dengan custom Symphonia ISO/MP4 patch, serta tombol hapus status milik sendiri.
-- ✨ **Animated Stickers**: Pemutaran stiker animasi terus-menerus tanpa perlu hover kursor, preview tajam pada panel stiker.
-- 🚫 **Block & Unblock Contacts**: Kelola pemblokiran kontak langsung dari aplikasi.
-- ⏳ **Disappearing Messages**: Pengaturan durasi pesan sementara per chat.
-- 🎨 **Modern WhatsApp Web UI**: Navigasi sidebar terintegrasi, filter unread/missed, dan badge notifikasi akurat.
-EOF
+            echo "# ZapFast (Calls & Extended Edition)" > release-notes.md
+            echo "" >> release-notes.md
+            echo "Versi fork dari ZapFast dengan dukungan penuh fitur-fitur WhatsApp modern:" >> release-notes.md
+            echo "" >> release-notes.md
+            echo "### ✨ Fitur Baru & Peningkatan:" >> release-notes.md
+            echo "- 📞 Voice & Video Calls: Panggilan suara & video call native WebRTC 30 FPS" >> release-notes.md
+            echo "- 📋 Call History: Halaman log panggilan terjawab & missed call" >> release-notes.md
+            echo "- 🌟 Starred Messages: Tandai pesan penting dengan bintang" >> release-notes.md
+            echo "- 📌 Pinned Messages: Sematkan pesan di bagian atas chat" >> release-notes.md
+            echo "- 🎬 Status Video: Audio story (AAC) jernih + tombol hapus status sendiri" >> release-notes.md
+            echo "- ✨ Animated Stickers: Pemutaran stiker animasi terus-menerus" >> release-notes.md
+            echo "- 🚫 Block & Unblock: Kelola pemblokiran kontak langsung dari aplikasi" >> release-notes.md
+            echo "- ⏳ Disappearing Messages: Pengaturan durasi pesan sementara" >> release-notes.md
+            echo "- 🎨 Modern WhatsApp Web UI: Sidebar rail terintegrasi & filter unread/missed" >> release-notes.md
           fi
 
       - name: Create GitHub Release
