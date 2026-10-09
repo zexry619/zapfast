@@ -28,6 +28,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         );
 
     let response = panel.show(ui, |ui| {
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
         let inset = theme::traffic_light_inset(ui.ctx());
         if inset > 0.0 {
             let (strip, _) =
@@ -37,10 +38,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(4.0);
         }
 
-        let bottom_height = 144.0;
+        let macos = theme::macos_chrome(ui.ctx());
+        let bottom_height = if macos { 82.0 } else { 132.0 };
 
         // Top Navigation Icons
         ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
             // 1. Chats
             let unread_chats = app.account().unread_chat_count();
             let is_chats = app.page == Page::Chats;
@@ -62,7 +65,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 app.actions.push(Action::Open(Page::Chats));
             }
 
-            ui.add_space(8.0);
+            ui.add_space(6.0);
 
             // 2. Stories / Status
             let is_stories = app.page == Page::Stories;
@@ -89,7 +92,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 app.actions.push(Action::Open(Page::Stories));
             }
 
-            ui.add_space(8.0);
+            ui.add_space(6.0);
 
             // 3. Calls
             let is_calls = app.page == Page::Calls;
@@ -129,6 +132,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
         // Bottom Navigation Icons
         ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
             // Starred messages
             let is_starred_open = matches!(
                 app.dialog,
@@ -150,29 +154,35 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     }));
             }
 
-            ui.add_space(8.0);
+            ui.add_space(6.0);
 
             // Settings
-            let is_settings = app.page == Page::Settings;
-            if nav_button(
-                ui,
-                &palette,
-                Icon::Settings,
-                is_settings,
-                None,
-                &crate::i18n::gettext(app.locale, "Settings"),
-            )
-            .tab_stop(Stop::Settings)
-            .clicked()
-            {
-                app.actions.push(Action::ToggleSettings);
+            if !macos {
+                let is_settings = app.page == Page::Settings;
+                let settings_label = if is_settings {
+                    crate::i18n::gettext(app.locale, "Close settings (Ctrl+,)")
+                } else {
+                    crate::i18n::gettext(app.locale, "Settings (Ctrl+,)")
+                };
+                if nav_button(
+                    ui,
+                    &palette,
+                    Icon::Settings,
+                    is_settings,
+                    None,
+                    &settings_label,
+                )
+                .tab_stop(Stop::Settings)
+                .clicked()
+                {
+                    app.actions.push(Action::ToggleSettings);
+                }
+
+                ui.add_space(6.0);
             }
 
-            ui.add_space(10.0);
-
             // Profile Avatar
-            super::accounts::avatar_button(app, ui, 36.0).tab_stop(Stop::Profile);
-            ui.add_space(6.0);
+            super::accounts::avatar_button(app, ui, 32.0).tab_stop(Stop::Profile);
         });
     });
 
@@ -189,6 +199,10 @@ fn nav_button(
 ) -> egui::Response {
     let size = vec2(44.0, 44.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    theme::reveal_focus(&response);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
+    });
     let hovered = response.hovered();
 
     if ui.is_rect_visible(rect) {

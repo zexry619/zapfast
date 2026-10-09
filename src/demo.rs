@@ -11196,7 +11196,9 @@ mod tests {
                         Stop::Attach,
                         Stop::Emoji,
                         Stop::ChatSearch,
-                        Stop::Sidebar
+                        Stop::Profile,
+                        Stop::Sidebar,
+                        Stop::Settings
                     ]
                 );
             }
