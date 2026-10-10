@@ -24,6 +24,7 @@ pub mod macos;
 pub mod markup;
 pub mod media_pause;
 pub mod model;
+pub mod nav;
 pub mod notify;
 pub mod opener;
 pub mod paths;
