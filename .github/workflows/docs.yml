@@ -20,6 +20,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.repository == 'crmne/zapfast' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
