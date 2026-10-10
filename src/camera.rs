@@ -386,6 +386,15 @@ impl Source {
         ))
     }
 
+    /// A platform with no screen capture backend returns an error.
+    pub fn open_screen(
+        _budget: (usize, usize),
+        _fps: u32,
+        _child: Arc<Mutex<Option<std::process::Child>>>,
+    ) -> Result<Self, String> {
+        Err("screen capture is not supported on this platform".to_owned())
+    }
+
     /// Unreachable: there is no source, so there is no frame size.
     pub fn size(&self) -> (usize, usize) {
         match *self {}

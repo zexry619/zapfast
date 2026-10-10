@@ -62,6 +62,8 @@ jobs:
   windows:
     name: build (x86_64-pc-windows-msvc)
     runs-on: windows-latest
+    env:
+      OPENH264_NO_ASM: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Resolve release version
@@ -77,6 +79,14 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Configure Strawberry Perl
+        shell: pwsh
+        run: |
+          if (Test-Path "C:\Strawberry\perl\bin") {
+            "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            Write-Host "Configured C:\Strawberry\perl\bin in PATH"
+          }
 
       - name: Set up NASM
         uses: ilammy/setup-nasm@v1
@@ -144,6 +154,8 @@ jobs:
   macos:
     name: build (macOS)
     runs-on: macos-latest
+    env:
+      OPENH264_NO_ASM: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Resolve release version
@@ -245,6 +257,27 @@ jobs:
           pattern: 'release-*'
           path: dist
           merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: 'log-*'
+          path: error-logs
+          merge-multiple: true
+
+      - name: Process build logs
+        shell: bash
+        run: |
+          if [ -d error-logs ] && [ "$(ls -A error-logs 2>/dev/null)" ]; then
+            echo "Processing build logs..."
+            for f in error-logs/*; do
+              echo "### Build Failure Log: $(basename "$f")" >> "$GITHUB_STEP_SUMMARY"
+              echo '```text' >> "$GITHUB_STEP_SUMMARY"
+              tail -n 120 "$f" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              cp "$f" dist/ || true
+            done
+          fi
 
       - name: List downloaded release assets
         shell: bash
